@@ -1,0 +1,140 @@
+{
+  "generated_at": "2026-09-29T08:55:00Z",
+  "route": "MLC (multilooked complex) -- SLC not publicly available, see download_scene.py docstring",
+  "scenes": {
+    "pongar_27500_24036_004_240703_L090_CX_01": {
+      "rows": 1371,
+      "cols": 3300,
+      "split": "train",
+      "valid_pixel_fraction": 0.9560278938178282,
+      "looks_used_for_synthetic_noise": 5,
+      "C_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": -9.796595534794506e-09,
+        "psd": true
+      },
+      "C_ref_report": {
+        "diag_real": true,
+        "diag_nonneg": false,
+        "hermitian": true,
+        "min_eigenvalue": -2.110082691619102,
+        "psd": false
+      },
+      "C_noisy_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": 6.356165647834978e-39,
+        "psd": true
+      },
+      "n_tiles": 3950
+    },
+    "sanber_28800_23001_106_230605_L090_CX_01": {
+      "rows": 2804,
+      "cols": 3223,
+      "split": "test",
+      "valid_pixel_fraction": 0.9179383602964251,
+      "looks_used_for_synthetic_noise": 4,
+      "C_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": -3.2086386880791906e-08,
+        "psd": true
+      },
+      "C_ref_report": {
+        "diag_real": true,
+        "diag_nonneg": false,
+        "hermitian": true,
+        "min_eigenvalue": -61.608466468118365,
+        "psd": false
+      },
+      "C_noisy_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": 6.964334173098171e-40,
+        "psd": true
+      },
+      "n_tiles": 7720
+    },
+    "tahoel_33416_25005_000_250302_L090_CX_01": {
+      "rows": 2106,
+      "cols": 3300,
+      "split": "val",
+      "valid_pixel_fraction": 0.9219714236380903,
+      "looks_used_for_synthetic_noise": 7,
+      "C_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": -1.700520968483943e-08,
+        "psd": true
+      },
+      "C_ref_report": {
+        "diag_real": true,
+        "diag_nonneg": false,
+        "hermitian": true,
+        "min_eigenvalue": -29.56815852038448,
+        "psd": false
+      },
+      "C_noisy_report": {
+        "diag_real": true,
+        "diag_nonneg": true,
+        "hermitian": true,
+        "min_eigenvalue": 3.2876887886928405e-38,
+        "psd": true
+      },
+      "n_tiles": 5955
+    }
+  },
+  "split": {
+    "train": [
+      "pongar_27500_24036_004_240703_L090_CX_01"
+    ],
+    "val": [
+      "tahoel_33416_25005_000_250302_L090_CX_01"
+    ],
+    "test": [
+      "sanber_28800_23001_106_230605_L090_CX_01"
+    ]
+  },
+  "db_min": -18.72898974260526,
+  "db_max": -4.600669764883553,
+  "ref_window": 9,
+  "tile_size": 64,
+  "stride": 32,
+  "valid_frac_thresh": 0.9,
+  "tile_counts_by_split": {
+    "train": 3950,
+    "val": 5955,
+    "test": 7720
+  },
+  "checklist_by_scene": {
+    "pongar_27500_24036_004_240703_L090_CX_01": {
+      "tiles_aligned_shape": true,
+      "no_nan_inputs": true,
+      "no_nan_targets": true,
+      "no_scene_leakage": true,
+      "all_ok": true
+    },
+    "sanber_28800_23001_106_230605_L090_CX_01": {
+      "tiles_aligned_shape": true,
+      "no_nan_inputs": true,
+      "no_nan_targets": true,
+      "no_scene_leakage": true,
+      "all_ok": true
+    },
+    "tahoel_33416_25005_000_250302_L090_CX_01": {
+      "tiles_aligned_shape": true,
+      "no_nan_inputs": true,
+      "no_nan_targets": true,
+      "no_scene_leakage": true,
+      "all_ok": true
+    }
+  },
+  "all_scenes_all_ok": true,
+  "elapsed_seconds": 628.4
+}

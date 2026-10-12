@@ -1,0 +1,11 @@
+numpy
+scipy
+h5py
+fsspec
+requests
+aiohttp
+tensorflow
+keras
+matplotlib
+scikit-image
+asf_search

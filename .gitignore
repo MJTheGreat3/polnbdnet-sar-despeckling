@@ -1,0 +1,18 @@
+# regeneratable data (see pipeline/prepare_training_data.py)
+pipeline/data/
+
+# trained weights (regeneratable via pipeline/train_nbdnet.py)
+pipeline/results/*.keras
+
+# python
+__pycache__/
+*.pyc
+
+# old/superseded artifacts, not part of the working pipeline
+despeckle_dataset.npz
+PEWork_GIS.zip
+PolNBDNet_SLC_preprocessing/
+PolNBDNet_SLC_preprocessing.zip
+
+# OS
+.DS_Store
