@@ -56,6 +56,12 @@ def make_dataset(split, batch_size, shuffle):
     )
     if shuffle:
         ds = ds.shuffle(SHUFFLE_BUFFER, reshuffle_each_iteration=True)
+    # .repeat() + explicit steps_per_epoch (passed by the caller, from
+    # meta.json's known tile counts) instead of letting Keras infer epoch
+    # boundaries from StopIteration -- a from_generator dataset has unknown
+    # cardinality, so without this Keras logs a (harmless but alarming)
+    # "input ran out of data; interrupting training" warning every epoch.
+    ds = ds.repeat()
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE), len(paths)
 
 
@@ -82,8 +88,10 @@ def main():
     val_ds, n_val_shards = make_dataset("val", args.batch_size, shuffle=False)
     n_train_tiles = sum(tile_counts[sid] for sid in meta["scenes"]["train"])
     n_val_tiles = sum(tile_counts[sid] for sid in meta["scenes"]["val"])
-    print(f"train: {n_train_tiles} tiles from {n_train_shards} scene(s), "
-          f"val: {n_val_tiles} tiles from {n_val_shards} scene(s)")
+    steps_per_epoch = -(-n_train_tiles // args.batch_size)  # ceil div
+    validation_steps = -(-n_val_tiles // args.batch_size)
+    print(f"train: {n_train_tiles} tiles from {n_train_shards} scene(s) ({steps_per_epoch} steps/epoch), "
+          f"val: {n_val_tiles} tiles from {n_val_shards} scene(s) ({validation_steps} steps)")
 
     model = build_nbdnet(TILE_SHAPE)
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=args.lr), loss="mse")
@@ -99,8 +107,11 @@ def main():
     history = model.fit(
         train_ds,
         validation_data=val_ds,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
         epochs=args.epochs,
         callbacks=callbacks,
+        shuffle=False,  # already shuffled in make_dataset(); avoids a harmless but noisy fit() warning
         verbose=2,
     )
     elapsed = time.time() - t0
