@@ -21,7 +21,8 @@ N_EXAMPLES = 5
 def main():
     with open(os.path.join(DATA_DIR, "meta.json")) as f:
         meta = json.load(f)
-    db_min, db_max = meta["db_min"], meta["db_max"]
+    test_scenes = meta["scenes"]["test"]
+    db_min, db_max = meta["per_scene_norm"][test_scenes[0]]
 
     model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
 

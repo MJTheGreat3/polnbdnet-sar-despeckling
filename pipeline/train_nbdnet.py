@@ -29,7 +29,13 @@ def main():
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=0.001)
+    p.add_argument("--mixed-precision", action="store_true",
+                    help="float16 compute on CUDA GPUs with tensor cores -- faster/bigger batches on a "
+                         "bigger remote box; not meaningful on Apple Metal")
     args = p.parse_args()
+
+    if args.mixed_precision:
+        keras.mixed_precision.set_global_policy("mixed_float16")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 

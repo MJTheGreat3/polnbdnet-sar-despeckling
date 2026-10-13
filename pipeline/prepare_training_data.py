@@ -8,9 +8,19 @@ gets a SEPARATE tile set per fixed L in {1,2,4,8}, same tile origins
 across all L, so recovery quality can be compared per noise severity
 (guide Step 13 / paper Table 1 style evaluation).
 
-One scene per split (howlnd=train, bermsr=val, monda=test) -- distinct
-real sites (Maine forest / Canadian boreal / Gabon tropical), so no
-scene-leakage concern (guide Step 11).
+Each split takes a LIST of scene ids (not just one) -- add more flight
+lines to "train" to grow/diversify the training set once you have the
+compute/disk for it. No scene id may appear in more than one split
+(guide Step 11: splitting crops from the same flight line across
+train/val/test leaks neighboring-region texture/speckle correlation).
+
+Each scene normalizes itself: db_min/db_max (1st/99th percentile of that
+scene's own valid diagonal power) are computed PER SCENE, not fit on
+train and reused everywhere. This is a radiometric calibration step
+(every flight line has its own absolute brightness/dynamic range), not a
+label statistic, so doing it per-scene isn't test-set leakage -- it's
+what removed the cross-scene blob/colour artifacts (report.md Next
+Steps #1) caused by applying one scene's brightness range to another.
 """
 import json
 import os
@@ -35,7 +45,10 @@ VALID_FRAC_THRESH = 0.95
 TRAIN_L_CHOICES = (1, 2, 4)
 TEST_L_VALUES = (1, 2, 4, 8)
 
-SCENES = {"train": "howlnd", "val": "bermsr", "test": "monda"}
+# Add more scene ids here (one list entry per crop you pulled with
+# nisar_to_legacy.py) to grow the training set. Keep val/test scenes
+# distinct flight lines never touched during train.
+SCENES = {"train": ["howlnd"], "val": ["bermsr"], "test": ["monda"]}
 
 
 def enumerate_tile_origins(valid_mask, tile_size=TILE_SIZE, stride=STRIDE, thresh=VALID_FRAC_THRESH):
@@ -75,36 +88,51 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     rng = np.random.default_rng(0)
 
+    all_ids = [sid for ids in SCENES.values() for sid in ids]
+    dupes = {sid for sid in all_ids if all_ids.count(sid) > 1}
+    if dupes:
+        raise ValueError(f"scene id(s) {dupes} appear in more than one split -- leakage (guide Step 11)")
+
     print("building clean references...")
     refs = {}
-    for split, sid in SCENES.items():
-        C_ref, valid_mask, report = build_scene_clean_ref(sid)
-        origins = enumerate_tile_origins(valid_mask)
-        refs[split] = {"scene_id": sid, "C_ref": C_ref, "valid_mask": valid_mask, "origins": origins, "report": report}
-        print(f"  {split}={sid}: {C_ref.shape[:2]}, {len(origins)} valid tile origins, "
-              f"hermitian/psd={report['hermitian']}/{report['psd']}")
+    per_scene_norm = {}
+    for split, sids in SCENES.items():
+        refs[split] = []
+        for sid in sids:
+            C_ref, valid_mask, report = build_scene_clean_ref(sid)
+            origins = enumerate_tile_origins(valid_mask)
+            diag = np.diagonal(C_ref, axis1=-2, axis2=-1).real
+            db_min, db_max = compute_db_norm_stats(diag[valid_mask])
+            per_scene_norm[sid] = [db_min, db_max]
+            refs[split].append({"scene_id": sid, "C_ref": C_ref, "origins": origins,
+                                 "db_min": db_min, "db_max": db_max})
+            print(f"  {split}={sid}: {C_ref.shape[:2]}, {len(origins)} valid tile origins, "
+                  f"hermitian/psd={report['hermitian']}/{report['psd']}, "
+                  f"db_min={db_min:.2f} db_max={db_max:.2f} (own scene stats)")
 
-    train_diag = np.diagonal(refs["train"]["C_ref"], axis1=-2, axis2=-1).real
-    db_min, db_max = compute_db_norm_stats(train_diag[refs["train"]["valid_mask"]])
-    print(f"db_min={db_min:.2f} db_max={db_max:.2f} (fit on train scene only)")
-
-    meta = {"db_min": db_min, "db_max": db_max, "ref_window": REF_WINDOW, "tile_size": TILE_SIZE,
+    meta = {"per_scene_norm": per_scene_norm, "ref_window": REF_WINDOW, "tile_size": TILE_SIZE,
             "stride": STRIDE, "scenes": SCENES, "train_L_choices": TRAIN_L_CHOICES, "test_L_values": TEST_L_VALUES}
 
     for split in ("train", "val"):
-        r = refs[split]
-        inputs, targets, Ls = build_tiles(r["C_ref"], r["origins"], db_min, db_max, rng, L_choices=TRAIN_L_CHOICES)
+        ins, tgts, Ls_all = [], [], []
+        for r in refs[split]:
+            i, t, Ls = build_tiles(r["C_ref"], r["origins"], r["db_min"], r["db_max"], rng, L_choices=TRAIN_L_CHOICES)
+            ins.append(i); tgts.append(t); Ls_all.append(Ls)
+        inputs, targets, Ls = np.concatenate(ins), np.concatenate(tgts), np.concatenate(Ls_all)
         out_path = os.path.join(OUT_DIR, f"{split}.npz")
         np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls)
-        print(f"  wrote {out_path}: {inputs.shape[0]} tiles, L distribution "
-              f"{dict(zip(*np.unique(Ls, return_counts=True)))}")
+        print(f"  wrote {out_path}: {inputs.shape[0]} tiles from {len(refs[split])} scene(s), "
+              f"L distribution {dict(zip(*np.unique(Ls, return_counts=True)))}")
 
-    r = refs["test"]
     for L in TEST_L_VALUES:
-        inputs, targets, Ls = build_tiles(r["C_ref"], r["origins"], db_min, db_max, rng, fixed_L=L)
+        ins, tgts, Ls_all = [], [], []
+        for r in refs["test"]:
+            i, t, Ls = build_tiles(r["C_ref"], r["origins"], r["db_min"], r["db_max"], rng, fixed_L=L)
+            ins.append(i); tgts.append(t); Ls_all.append(Ls)
+        inputs, targets, Ls = np.concatenate(ins), np.concatenate(tgts), np.concatenate(Ls_all)
         out_path = os.path.join(OUT_DIR, f"test_L{L}.npz")
         np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls)
-        print(f"  wrote {out_path}: {inputs.shape[0]} tiles, fixed L={L}")
+        print(f"  wrote {out_path}: {inputs.shape[0]} tiles from {len(refs['test'])} scene(s), fixed L={L}")
 
     meta["elapsed_seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(OUT_DIR, "meta.json"), "w") as f:
