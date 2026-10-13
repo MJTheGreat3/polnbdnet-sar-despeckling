@@ -44,17 +44,12 @@ def _find_frequencyA(hf):
     raise KeyError("could not find science/{LSAR,SSAR}/RSLC/swaths/frequencyA in this file")
 
 
-def convert(h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, col_size):
+def crop_from_open_file(freq, band, h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, col_size):
+    """Write one crop's .ann+.slc given an already-open NISAR HDF5 handle --
+    lets a caller pull many crops from the same file without reopening/
+    re-authenticating the HTTP connection for each one (see
+    batch_pull_crops.py)."""
     os.makedirs(out_dir, exist_ok=True)
-    hf = _open(h5_path_or_url)
-    freq, band = _find_frequencyA(hf)
-
-    pols = [p.decode() if isinstance(p, bytes) else p for p in freq["listOfPolarizations"][:]]
-    print(f"band={band} polarizations in file={pols}")
-    for pol in ("HH", "HV", "VH", "VV"):
-        if pol not in pols:
-            raise ValueError(f"file is missing {pol} -- not full quad-pol, can't build the covariance matrix")
-
     rows_total, cols_total = freq["HH"].shape
     row_end = min(row_start + row_size, rows_total)
     col_end = min(col_start + col_size, cols_total)
@@ -70,8 +65,8 @@ def convert(h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, c
         print(f"  wrote {out_path}  ({crop.nbytes / 1e6:.1f} MB)")
 
     slant_range_spacing = float(freq["slantRangeSpacing"][()])
-    az_spacing = float(hf.get(f"science/{band}/RSLC/swaths/zeroDopplerTimeSpacing", [0.0])[()]) \
-        if f"science/{band}/RSLC/swaths/zeroDopplerTimeSpacing" in hf else 0.0
+    swaths = freq.parent
+    az_spacing = float(swaths["zeroDopplerTimeSpacing"][()]) if "zeroDopplerTimeSpacing" in swaths else 0.0
 
     ann_path = os.path.join(out_dir, f"{scene_id}.ann")
     with open(ann_path, "w") as f:
@@ -85,6 +80,19 @@ def convert(h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, c
         if az_spacing:
             f.write(f"Azimuth time spacing (s) = {az_spacing}\n")
     print(f"  wrote {ann_path}")
+
+
+def convert(h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, col_size):
+    hf = _open(h5_path_or_url)
+    freq, band = _find_frequencyA(hf)
+
+    pols = [p.decode() if isinstance(p, bytes) else p for p in freq["listOfPolarizations"][:]]
+    print(f"band={band} polarizations in file={pols}")
+    for pol in ("HH", "HV", "VH", "VV"):
+        if pol not in pols:
+            raise ValueError(f"file is missing {pol} -- not full quad-pol, can't build the covariance matrix")
+
+    crop_from_open_file(freq, band, h5_path_or_url, out_dir, scene_id, row_start, row_size, col_start, col_size)
 
 
 def main():

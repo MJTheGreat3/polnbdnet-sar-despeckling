@@ -45,10 +45,27 @@ VALID_FRAC_THRESH = 0.95
 TRAIN_L_CHOICES = (1, 2, 4)
 TEST_L_VALUES = (1, 2, 4, 8)
 
+# batch_pull_crops.py names each crop "<prefix>_r<row>_c<col>" -- any
+# scene id starting with one of these prefixes is auto-added to train, so a
+# 100+ scene pull (see pull_200gb_dataset.sh) doesn't need a hand-typed list.
+# Keep val/test scenes' flight lines out of this list (leakage, guide Step 11).
+AUTO_TRAIN_PREFIXES = ["bermsR_r", "bermsA1_r", "bermsA2_r", "bermsB1_r", "bermsB2_r"]
+
+
+def discover_scenes(prefixes, raw_dir=RAW_DIR):
+    if not os.path.isdir(raw_dir):
+        return []
+    found = []
+    for name in sorted(os.listdir(raw_dir)):
+        if any(name.startswith(p) for p in prefixes) and os.path.isfile(os.path.join(raw_dir, name, f"{name}.ann")):
+            found.append(name)
+    return found
+
+
 # Add more scene ids here (one list entry per crop you pulled with
 # nisar_to_legacy.py) to grow the training set. Keep val/test scenes
 # distinct flight lines never touched during train.
-SCENES = {"train": ["howlnd"], "val": ["bermsr"], "test": ["monda"]}
+SCENES = {"train": ["howlnd"] + discover_scenes(AUTO_TRAIN_PREFIXES), "val": ["bermsr"], "test": ["monda"]}
 
 
 def enumerate_tile_origins(valid_mask, tile_size=TILE_SIZE, stride=STRIDE, thresh=VALID_FRAC_THRESH):
@@ -83,6 +100,67 @@ def build_tiles(C_ref, origins, db_min, db_max, rng, fixed_L=None, L_choices=Non
     return (np.stack(inputs).astype("float32"), np.stack(targets).astype("float32"), np.array(Ls, dtype="int8"))
 
 
+def _scene_done(split_dir, sid, split):
+    """True if sid's shard(s) already exist AND carry the norm/count sidecar
+    fields -- lets a re-run after a crash/interruption skip finished scenes
+    entirely, without even rebuilding their (expensive, ~8GB+) C_ref."""
+    if split == "test":
+        paths = [os.path.join(split_dir, f"{sid}_L{L}.npz") for L in TEST_L_VALUES]
+    else:
+        paths = [os.path.join(split_dir, f"{sid}.npz")]
+    if not all(os.path.exists(p) for p in paths):
+        return None
+    try:
+        d = np.load(paths[0])
+        return float(d["db_min"]), float(d["db_max"]), int(d["n_tiles"])
+    except Exception:
+        return None
+
+
+def process_scene(sid, split, rng):
+    """Build one scene's C_ref, tile it, write its shard(s), then let C_ref
+    be garbage-collected before the caller moves to the next scene.
+
+    build_covariance() materializes 2-3 dense (H,W,3,3) complex128 arrays
+    (~470 bytes/pixel) before windowing -- at 8192x8192 that's ~32GB for
+    ONE scene. Processing scene-by-scene and freeing C_ref immediately
+    keeps peak memory bounded by the single largest scene, not by how
+    many scenes (or their total size) you add to train."""
+    split_dir = os.path.join(OUT_DIR, split)
+    os.makedirs(split_dir, exist_ok=True)
+
+    done = _scene_done(split_dir, sid, split)
+    if done is not None:
+        db_min, db_max, n_tiles = done
+        print(f"  {split}={sid}: already done ({n_tiles} tiles, db_min={db_min:.2f} db_max={db_max:.2f}), skipping")
+        return db_min, db_max, n_tiles
+
+    C_ref, valid_mask, report = build_scene_clean_ref(sid)
+    origins = enumerate_tile_origins(valid_mask)
+    diag = np.diagonal(C_ref, axis1=-2, axis2=-1).real
+    db_min, db_max = compute_db_norm_stats(diag[valid_mask])
+    print(f"  {split}={sid}: {C_ref.shape[:2]}, {len(origins)} valid tile origins, "
+          f"hermitian/psd={report['hermitian']}/{report['psd']}, "
+          f"db_min={db_min:.2f} db_max={db_max:.2f} (own scene stats)")
+
+    if split == "test":
+        for L in TEST_L_VALUES:
+            inputs, targets, Ls = build_tiles(C_ref, origins, db_min, db_max, rng, fixed_L=L)
+            out_path = os.path.join(split_dir, f"{sid}_L{L}.npz")
+            np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls,
+                                 db_min=db_min, db_max=db_max, n_tiles=len(origins))
+            print(f"    wrote {out_path}: {inputs.shape[0]} tiles, fixed L={L}")
+    else:
+        inputs, targets, Ls = build_tiles(C_ref, origins, db_min, db_max, rng, L_choices=TRAIN_L_CHOICES)
+        out_path = os.path.join(split_dir, f"{sid}.npz")
+        np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls,
+                             db_min=db_min, db_max=db_max, n_tiles=len(origins))
+        print(f"    wrote {out_path}: {inputs.shape[0]} tiles, "
+              f"L distribution {dict(zip(*np.unique(Ls, return_counts=True)))}")
+
+    return db_min, db_max, len(origins)  # C_ref/valid_mask/origins go out of scope here -> GC'd
+
+
 def main():
     t0 = time.time()
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -93,51 +171,23 @@ def main():
     if dupes:
         raise ValueError(f"scene id(s) {dupes} appear in more than one split -- leakage (guide Step 11)")
 
-    print("building clean references...")
-    refs = {}
     per_scene_norm = {}
+    tile_counts = {}
     for split, sids in SCENES.items():
-        refs[split] = []
+        print(f"building {split} ({len(sids)} scene(s))...")
         for sid in sids:
-            C_ref, valid_mask, report = build_scene_clean_ref(sid)
-            origins = enumerate_tile_origins(valid_mask)
-            diag = np.diagonal(C_ref, axis1=-2, axis2=-1).real
-            db_min, db_max = compute_db_norm_stats(diag[valid_mask])
+            db_min, db_max, n_tiles = process_scene(sid, split, rng)
             per_scene_norm[sid] = [db_min, db_max]
-            refs[split].append({"scene_id": sid, "C_ref": C_ref, "origins": origins,
-                                 "db_min": db_min, "db_max": db_max})
-            print(f"  {split}={sid}: {C_ref.shape[:2]}, {len(origins)} valid tile origins, "
-                  f"hermitian/psd={report['hermitian']}/{report['psd']}, "
-                  f"db_min={db_min:.2f} db_max={db_max:.2f} (own scene stats)")
+            tile_counts[sid] = n_tiles
 
-    meta = {"per_scene_norm": per_scene_norm, "ref_window": REF_WINDOW, "tile_size": TILE_SIZE,
-            "stride": STRIDE, "scenes": SCENES, "train_L_choices": TRAIN_L_CHOICES, "test_L_values": TEST_L_VALUES}
-
-    for split in ("train", "val"):
-        ins, tgts, Ls_all = [], [], []
-        for r in refs[split]:
-            i, t, Ls = build_tiles(r["C_ref"], r["origins"], r["db_min"], r["db_max"], rng, L_choices=TRAIN_L_CHOICES)
-            ins.append(i); tgts.append(t); Ls_all.append(Ls)
-        inputs, targets, Ls = np.concatenate(ins), np.concatenate(tgts), np.concatenate(Ls_all)
-        out_path = os.path.join(OUT_DIR, f"{split}.npz")
-        np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls)
-        print(f"  wrote {out_path}: {inputs.shape[0]} tiles from {len(refs[split])} scene(s), "
-              f"L distribution {dict(zip(*np.unique(Ls, return_counts=True)))}")
-
-    for L in TEST_L_VALUES:
-        ins, tgts, Ls_all = [], [], []
-        for r in refs["test"]:
-            i, t, Ls = build_tiles(r["C_ref"], r["origins"], r["db_min"], r["db_max"], rng, fixed_L=L)
-            ins.append(i); tgts.append(t); Ls_all.append(Ls)
-        inputs, targets, Ls = np.concatenate(ins), np.concatenate(tgts), np.concatenate(Ls_all)
-        out_path = os.path.join(OUT_DIR, f"test_L{L}.npz")
-        np.savez_compressed(out_path, inputs=inputs, targets=targets, Ls=Ls)
-        print(f"  wrote {out_path}: {inputs.shape[0]} tiles from {len(refs['test'])} scene(s), fixed L={L}")
-
-    meta["elapsed_seconds"] = round(time.time() - t0, 1)
+    meta = {"per_scene_norm": per_scene_norm, "tile_counts": tile_counts, "ref_window": REF_WINDOW,
+            "tile_size": TILE_SIZE, "stride": STRIDE, "scenes": SCENES, "train_L_choices": TRAIN_L_CHOICES,
+            "test_L_values": TEST_L_VALUES, "elapsed_seconds": round(time.time() - t0, 1)}
     with open(os.path.join(OUT_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"done in {meta['elapsed_seconds']}s")
+    print(f"done in {meta['elapsed_seconds']}s. Tiles are per-scene shards under "
+          f"{OUT_DIR}/{{train,val,test}}/ -- train_nbdnet.py streams them instead of "
+          f"loading everything into RAM at once.")
 
 
 if __name__ == "__main__":

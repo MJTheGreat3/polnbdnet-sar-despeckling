@@ -108,7 +108,7 @@ def main():
     results = {}
     example_tiles = {}
     for L in TEST_L_VALUES:
-        d = np.load(os.path.join(DATA_DIR, f"test_L{L}.npz"))
+        d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
         noisy, clean = d["inputs"], d["targets"]
 
         denoised = model.predict(noisy, batch_size=64, verbose=0)

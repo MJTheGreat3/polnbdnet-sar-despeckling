@@ -26,7 +26,7 @@ def main():
 
     model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
 
-    d = np.load(os.path.join(DATA_DIR, f"test_L{L}.npz"))
+    d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
     noisy, clean = d["inputs"], d["targets"]
     n = noisy.shape[0]
 
@@ -53,7 +53,7 @@ def main():
     for col, title in enumerate(["Before (noisy input, L=1)", "After (NBDNet output)", "Ground truth (C_ref)"]):
         axes[0, col].set_title(title, fontsize=11)
 
-    fig.suptitle(f"Before / after examples, test scene (monda), L={L}", fontsize=13)
+    fig.suptitle(f"Before / after examples, test scene ({test_scenes[0]}), L={L}", fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out_path = os.path.join(RESULTS_DIR, "before_after_examples.png")
     fig.savefig(out_path, dpi=120)
