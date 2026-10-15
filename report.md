@@ -1,6 +1,6 @@
 # PolNBDNet: Real-Data Training & Wishart-Noise Effectiveness Report
 
-**Date:** 2026-10-11
+**Date:** 2026-10-11 (scale-up update: 2026-10-15)
 **Goal:** Pull real UAVSAR SAR data, run it through the PolNBDNet preprocessing pipeline, train the NBDNet despeckling model, and measure how effective the pipeline is at recovering a clean signal from Wishart-simulated speckle, across different noise severities (look counts, L).
 
 ---
@@ -181,33 +181,136 @@ The speckle removal is visually obvious (grainy noise gone in every example). Th
 
 ---
 
-## 7. Files
+## 7. Scale-up run (200GB, remote GPU)
+
+Following Next Steps #1 and #3 below, fixed per-scene normalization and added classical-filter baselines, then scaled training data ~126x on a remote server with a real CUDA GPU.
+
+### 7.1 Environment & data
+
+- Remote Ubuntu box, NVIDIA Quadro RTX 8000 (17.7GB VRAM), CUDA 12.5 / cuDNN 9.27.
+- Train: 126 scenes — `howlnd` (original anchor) + 125 new 4096×4096 crops cut from 5 additional real UAVSAR L-band flight lines (`bermsR_27037`, `bermsA_09041`, `bermsA_27041`, `bermsB_09043`, `bermsB_27043`), 484,344 tiles total.
+- Val: `bermsr` (unchanged), 3,844 tiles. Test: `monda` (unchanged), 3,844 tiles × 4 (L=1,2,4,8).
+- **Val and test are each one flight-line scene, not touched by the 200GB scale-up at all** — only train grew (1 → 126 scenes). Tile counts in the thousands come from one 4096×4096 crop each, not independent scenes. Generalization is tested across *different* flight lines (train vs. val vs. test are 3 distinct real sites), but not across *multiple* held-out scenes per split — a single unusual scene could swing val_loss or test metrics more than the tile count alone suggests.
+
+**Flight line metadata** (parsed from UAVSAR filenames — `<site>_<line>_<flight>_<segment>_<date>_L090_CX_RSLC_02.h5`):
+
+| Scene ID(s) | Split | Site | Flight ID | Line | Segment | Date | Crops |
+|---|---|---|---|---|---|---|---|
+| `howlnd` | train (anchor) | Howland Forest, Maine, USA | 22025 | 16701 | 000 | 2022-07-21 | 1 |
+| `bermsr` | **val** | BERMS boreal forest, Saskatchewan, Canada | **22031** | 09037 | 000 | **2022-08-14** | 1 |
+| `monda` | test | Mondah forest, Gabon | 24038 | 09137 | 004 | 2024-07-06 | 1 |
+| `bermsR_r*_c*` (25 crops) | train | BERMS, Saskatchewan, Canada | **22031** | 27037 | 001 | **2022-08-14** | 25 |
+| `bermsA1_r*_c*` (25 crops) | train | BERMS site A, Saskatchewan, Canada | **22031** | 09041 | 008 | **2022-08-14** | 25 |
+| `bermsA2_r*_c*` (25 crops) | train | BERMS site A, Saskatchewan, Canada | **22031** | 27041 | 009 | **2022-08-14** | 25 |
+| `bermsB1_r*_c*` (25 crops) | train | BERMS site B, Saskatchewan, Canada | **22031** | 09043 | 012 | **2022-08-14** | 25 |
+| `bermsB2_r*_c*` (25 crops) | train | BERMS site B, Saskatchewan, Canada | **22031** | 27043 | 013 | **2022-08-14** | 25 |
+
+All UAVSAR L-band (`L090`), full quad-pol (`CX`), RSLC product.
+
+**Caveat this table makes visible:** 5 of the 6 flight lines feeding train, *and* the entire val scene, are flight ID **22031** flown on **2022-08-14** over the same BERMS research site (different swaths/lines — `09037`/`27037`/`09041`/`27041`/`09043`/`27043` — so not literal pixel overlap, but the same campaign, same day, same broad forest). Only `howlnd` (Maine, 2022-07-21) and `monda` (Gabon, 2024-07-06, the test scene) are genuinely independent campaigns. So the 126x scale-up mostly added *more swaths of one site/day*, not diversity of site/season/campaign — the "trained on many kinds of data" framing from earlier in this project is weaker than the scene count (126) suggests, and val (`bermsr`) sharing a campaign with most of train means val_loss may be a slightly optimistic proxy for genuine out-of-distribution performance. `monda` (the actual test scene) remains a fully independent check, so the headline results in §7.3 aren't invalidated — but the *margin* for a true out-of-campaign scene could be narrower than val suggests.
+
+- Fix applied: dB percentile normalization now fit **per scene** instead of reusing the train scene's range globally — directly addresses the domain-shift risk flagged below.
+- Fix applied: boxcar and Lee filter baselines added to evaluation, same metrics, same test tiles.
+- Memory-safety fix: the data-prep script previously held every scene's dense covariance array in memory at once (fine at 3 scenes, would not have survived 126) — rewritten to build/tile/write/free one scene at a time, and the whole pipeline switched from one big in-RAM array to per-scene disk shards streamed via `tf.data`.
+- Timing: each new flight-line download took ~1h20m–2h depending on server bandwidth (5 lines, ~205GB total). Tiling (`prepare_training_data.py`, 126 train + 1 val + 4 test-L shards) took 35,525.3s (**~9h 52m**). Training (next) took another 48,647.6s (**~13h 31m**) — roughly a full day end-to-end for the data pull + prep + train stages combined.
+
+### 7.2 Training
+
+Adam, lr=0.001, batch size 32, 20 epochs, fp32. `ReduceLROnPlateau` halved the learning rate 3 times (0.001 → 0.000125 by epoch 18). 48,647.6s (~13h 31m). Final train loss 0.00214, val loss 0.00216 — val tracks train closely, no overfitting despite 126 training scenes.
+
+Mixed-precision (fp16) was tried first and produced NaN loss within 2 epochs — likely fp16 overflow in an unguarded op (candidate: an unprotected division or exp inside the SE/CBAM attention blocks). Not debugged further; reverted to fp32 for this run. Flagged as an open item below.
+
+### 7.3 Results
+
+**PSNR (dB)**
+
+| L | Noisy | Boxcar | Lee | **NBDNet** | Gain (NBDNet − noisy) |
+|---|---|---|---|---|---|
+| 1 (severe) | 18.35 | 32.28 | 31.66 | **34.40** | **+16.05** |
+| 2 | 21.75 | 35.50 | 34.89 | **35.50** | **+13.74** |
+| 4 | 25.02 | **38.10** | 37.57 | 36.21 | +11.19 |
+| 8 (mild) | 28.17 | **40.02** | 39.62 | 35.89 | +7.72 |
+
+**SSIM**
+
+| L | Noisy | Boxcar | Lee | **NBDNet** |
+|---|---|---|---|---|
+| 1 | 0.116 | 0.845 | 0.815 | **0.933** |
+| 2 | 0.206 | 0.902 | 0.880 | **0.947** |
+| 4 | 0.327 | 0.935 | 0.921 | **0.957** |
+| 8 | 0.473 | 0.954 | 0.945 | **0.962** |
+
+**CC**
+
+| L | Noisy | Boxcar | Lee | **NBDNet** |
+|---|---|---|---|---|
+| 1 | 0.350 | 0.844 | 0.821 | **0.890** |
+| 2 | 0.462 | 0.899 | 0.879 | **0.922** |
+| 4 | 0.573 | 0.935 | 0.920 | **0.940** |
+| 8 | 0.677 | **0.957** | 0.947 | 0.949 |
+
+```mermaid
+xychart-beta
+    title "PSNR by method vs look count"
+    x-axis ["L=1", "L=2", "L=4", "L=8"]
+    y-axis "PSNR (dB)" 15 --> 42
+    line [18.35, 21.75, 25.02, 28.17]
+    line [32.28, 35.50, 38.10, 40.02]
+    line [31.66, 34.89, 37.57, 39.62]
+    line [34.40, 35.50, 36.21, 35.89]
+```
+*(bottom to top at L=8: noisy, Lee, boxcar, NBDNet — NBDNet leads at L=1–2, falls behind boxcar/Lee at L=4,8)*
+
+<img src="/Users/mj/IIITB/Sem_7/GIS/pipeline/results/before_after_examples.png" alt="before-after, scale-up model" style="max-height:1000px;" />
+
+### 7.4 Insights
+
+1. **Scale mattered more than anything else tried so far.** Same architecture, same loss, same test scene — but PSNR gain at L=1 jumped from +6.56dB (3-scene run) to +16.05dB (126-scene run). Fixing the normalization bug and multiplying real training data ~126x outperformed any plausible architecture tweak would have.
+
+2. **NBDNet only wins on raw PSNR at severe noise.** At L=1 it clearly beats both classical filters; at L=2 it's roughly tied with boxcar; at L=4 and L=8, boxcar and Lee both overtake it. Once the input is already fairly clean, simple spatial averaging catches up — there's less speckle left for the network's learned transform to remove, and boxcar's large window preserves more of the real signal than NBDNet's output does at that point.
+
+3. **But by SSIM and CC, NBDNet wins or ties at every L, including L=8.** PSNR penalizes any absolute intensity/dB offset; SSIM and CC care more about structure and correlation. So NBDNet's output seems to drift slightly in absolute level at high L (hurting PSNR) while still preserving structure/texture better than boxcar's blur (helping SSIM/CC). Which filter "wins" genuinely depends on which metric is trusted — worth stating directly rather than picking the metric that looks best.
+
+4. **The boxcar-advantage caveat from Next Steps #3 holds, but doesn't fully explain the L=4/8 result.** Boxcar beats Lee (the fairer baseline) at every L and metric, confirming the earlier concern that boxcar benefits from resembling how `C_ref` itself was built. But NBDNet also loses to Lee — not just boxcar — at L=4 and L=8 on PSNR, so the "NBDNet underperforms classical filters at mild noise" finding isn't purely a boxcar artifact.
+
+5. **Mixed precision is not usable yet on this setup.** NaN within 2 epochs on the first attempt. Worth a real debugging pass (loss-scaling check, audit SE/CBAM for unguarded division/exp) if training speed becomes a bottleneck for future scale-ups — fp32 at batch 32 fit comfortably in the RTX 8000's 17.7GB, so there's no capacity reason to need fp16 yet.
+
+---
+
+## 8. Files
 
 ```
-pipeline/data/raw/{howlnd,bermsr,monda}/        real SLC crops (.ann + 4x .slc)
-pipeline/data/experiment/{train,val,test_L*}.npz  tiles + meta.json
+pipeline/data/raw/{howlnd,bermsr,monda,...}/     real SLC crops (.ann + 4x .slc), 128 scenes after scale-up
+pipeline/data/experiment/{train,val,test}/*.npz  per-scene shards + meta.json
 pipeline/model.py                                NBDNet architecture
-pipeline/prepare_training_data.py                tile/noise generation
-pipeline/train_nbdnet.py                         training script
-pipeline/evaluate_nbdnet.py                      evaluation script
+pipeline/prepare_training_data.py                tile/noise generation, per-scene shards + per-scene normalization
+pipeline/train_nbdnet.py                         training script, tf.data streaming trainer
+pipeline/evaluate_nbdnet.py                      evaluation script, incl. boxcar/Lee baselines
 pipeline/make_before_after.py                    before/after example figure generation
-pipeline/results/nbdnet_model.keras              trained model (1.42M params)
-pipeline/results/train_history.json              full loss curves
-pipeline/results/evaluation.json                 full metrics table (above)
+pipeline/batch_pull_crops.py                     cuts multiple crops from one downloaded flight line
+pipeline/nisar_to_legacy.py                      NISAR HDF5 -> legacy .ann/.slc converter
+pull_200gb_dataset.sh                            scale-up data pull (5 flight lines, ~205GB)
+pipeline/results/nbdnet_model.keras              trained model (1.42M params, 200GB-scale weights)
+pipeline/results/train_history.json              full loss curves (20 epochs, scale-up run)
+pipeline/results/evaluation.json                 full metrics table incl. boxcar/Lee (above)
 pipeline/results/evaluation_examples.png         visual comparison, clean/noisy/denoised x L
 pipeline/results/before_after_examples.png       5 varied test tiles, before/after at L=1
 ```
 
-Total disk used: ~6.9GB.
+Total disk used (small-scale run): ~6.9GB. Scale-up run: ~205GB raw data (reclaimable after tiling) + shards/model (gitignored, not in repo).
 
 ---
 
-## 8. Next steps
+## 9. Next steps
 
-Three gaps identified, not yet actioned:
+1. ~~**Normalization domain-shift risk.**~~ **Resolved (2026-10-15).** Switched from a single train-scene-fit global dB range to per-scene percentile normalization (see §7.1). Not re-verified in isolation whether this specifically fixed the #2628/#3628 blob artifacts — the scale-up run changed multiple things at once (normalization + 126x more data), so the artifact's exact cause is still not isolated. Worth a follow-up: re-run eval on a held-out Howland tile specifically to confirm.
 
-1. **Normalization domain-shift risk.** `db_min`/`db_max` were fit on the train scene (howlnd/Maine) only and reused as-is for val/test scenes. Blob/swirl artifacts seen on some test tiles (e.g. #2628, #3628) may be partly this — Gabon forest's actual dB range likely differs from Maine's, so test tiles could clip or stretch incorrectly. Next: count clipped pixels per scene, compare dB histograms across scenes, sanity-check on a held-out Howland tile the model never saw (if that's clean but Mondah isn't, confirms domain shift, not a channel-order bug), then try per-scene percentile normalization instead of a single fixed global min/max.
+2. **No full-scene stitching, so no seam-blur check yet.** Still open. Current tiling uses non-overlapping `STRIDE=64` and evaluates per-tile — borders-get-blurry-at-reconstruction isn't an issue yet because there's no reconstruction. If a full-scene mosaic output is ever needed: switch to overlapping tiles (e.g. stride 48, 16px overlap), keep only the center crop of each tile's prediction when stitching, discard the border ring, and check for visible seams/grid lines in the result.
 
-2. **No full-scene stitching, so no seam-blur check yet.** Current tiling uses non-overlapping `STRIDE=64` and evaluates per-tile — borders-get-blurry-at-reconstruction isn't an issue yet because there's no reconstruction. If a full-scene mosaic output is ever needed: switch to overlapping tiles (e.g. stride 48, 16px overlap), keep only the center crop of each tile's prediction when stitching, discard the border ring, and check for visible seams/grid lines in the result.
+3. ~~**No classical-filter baseline.**~~ **Resolved (2026-10-15).** Boxcar and Lee filter baselines added (see §7.3). Finding: NBDNet beats both at L=1, roughly ties boxcar at L=2, but loses to both on raw PSNR at L=4 and L=8 — though it still wins on SSIM/CC at every L. See §7.4 for the full discussion.
 
-3. **No classical-filter baseline.** Current results only compare noisy-vs-clean and denoised-vs-clean — never checked whether NBDNet beats a simple classical filter. Next: add boxcar and refined Lee filter baselines, computed with the same PSNR/SSIM/RMSE/CC metrics on the same test tiles/L values, reported side by side. Caveat to flag: boxcar will look artificially strong since `C_ref` itself is generated via large-window multilooking (a boxcar-like average) — Lee (edge-preserving, adaptive) is the fairer baseline to actually try to beat.
+4. **New: mixed-precision (fp16) training is broken on the remote GPU.** NaN loss within 2 epochs when `--mixed-precision` was used (§7.2). Not debugged — candidate cause is an unguarded division/exp inside the SE or CBAM attention blocks overflowing in fp16. Worth fixing only if training speed becomes a bottleneck; fp32 fit comfortably in VRAM for this run.
+
+5. **New: the L=4/L=8 classical-filter-catchup result deserves a decision, not just a note.** NBDNet is only the clear best choice at severe noise (L≤2). Options worth considering: (a) report this honestly as the real operating envelope of the model, (b) train a second model variant seeing higher L more often to see if that shifts the crossover point, or (c) look into a hybrid — classical filter at high L, NBDNet at low L — chosen by estimated look count at inference time.
+
+6. **New: val and test are each a single scene.** Even after scaling train to 126 scenes, val (`bermsr`) and test (`monda`) are still one flight-line crop apiece — unchanged since the very first run. Metrics are solid evidence the model generalizes across *different* sites (train/val/test are 3 distinct real locations), but not evidence it's robust across the *range* of scenes a given split might contain, since each split is only one sample of that range. Next: pull 2-3 more held-out scenes per split (same data source already supports this) and report variance across them, not just a single point estimate.
