@@ -76,7 +76,10 @@ def conv_block(x, filters, n_layers=1, kernel_size=3, name=None):
 
 def noise_estimation_subnetwork(inputs, channels, filters=32, n_layers=3):
     x = conv_block(inputs, filters, n_layers=n_layers, name="noise_est")
-    noise = layers.Conv2D(channels, 3, padding="same", name="estimated_noise")(x)
+    # No BatchNorm follows this conv (unlike every other block), so under
+    # mixed_float16 it's the first unguarded fp16 compute in the graph --
+    # force float32 here to stop it overflowing before the concat below.
+    noise = layers.Conv2D(channels, 3, padding="same", name="estimated_noise", dtype="float32")(x)
     return noise
 
 
@@ -99,7 +102,10 @@ def non_blind_denoising_subnetwork(x, out_channels):
     x = cbam_block(x, name="nbd_64b")
 
     x = conv_block(x, 64, n_layers=1, name="nbd_64c")
-    out = layers.Conv2D(out_channels, 3, padding="same", activation=None, name="output_image")(x)
+    # Same reasoning as estimated_noise above, plus this feeds MSE loss
+    # directly -- TF mixed-precision guidance is to keep the model's final
+    # output float32 regardless.
+    out = layers.Conv2D(out_channels, 3, padding="same", activation=None, name="output_image", dtype="float32")(x)
     return out
 
 

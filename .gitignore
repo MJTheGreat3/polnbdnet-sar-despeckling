@@ -16,3 +16,7 @@ PolNBDNet_SLC_preprocessing.zip
 
 # OS
 .DS_Store
+
+# Agents
+AGENTS.md
+CLAUDE.md
