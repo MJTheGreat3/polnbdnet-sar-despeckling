@@ -102,6 +102,7 @@ def non_blind_denoising_subnetwork(x, out_channels):
     x = conv_block(skip, 256, n_layers=2, name="nbd_256")
 
     x = layers.Conv2D(128, 3, padding="same", name="nbd_bottleneck_proj")(x)
+    x = layers.BatchNormalization(name="nbd_bottleneck_proj_bn")(x)
     x = layers.Add(name="nbd_skip_add")([x, skip])
     x = squeeze_excitation_block(x, name="nbd_128b")
     x = cbam_block(x, name="nbd_128b")
