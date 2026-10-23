@@ -69,7 +69,16 @@ def cbam_block(x, reduction=8, kernel_size=7, name=None):
 def conv_block(x, filters, n_layers=1, kernel_size=3, name=None):
     for i in range(n_layers):
         x = layers.Conv2D(filters, kernel_size, padding="same", name=f"{name}_conv{i}" if name else None)(x)
-        x = layers.BatchNormalization(name=f"{name}_bn{i}" if name else None)(x)
+        # fused=False: BatchNormalization only casts to float32 internally
+        # for the mean/variance math on the NON-fused path (see its `call`
+        # source -- "it's very easy for variance to overflow in float16").
+        # fused defaults to True for our rank-4 feature maps, which skips
+        # that safety cast and runs variance in raw fp16 under
+        # mixed_float16 -- the actual cause of the intermittent fp16 NaN/inf
+        # (clipnorm alone didn't fix it because this is a forward-pass
+        # overflow in a specific batch's variance, not a gradient-magnitude
+        # issue).
+        x = layers.BatchNormalization(fused=False, name=f"{name}_bn{i}" if name else None)(x)
         x = layers.ReLU(name=f"{name}_relu{i}" if name else None)(x)
     return x
 
