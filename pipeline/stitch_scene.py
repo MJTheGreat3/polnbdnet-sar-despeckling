@@ -122,6 +122,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default=None, help="scene id (default: the test scene from meta.json)")
     p.add_argument("--L", type=int, default=1, choices=(1, 2, 4, 8))
+    p.add_argument("--crop-size", type=int, default=1024,
+                    help="test on a crop_size x crop_size top-left crop instead of the full scene "
+                         "(default 1024 -- plenty of stride=48 tile boundaries to check for seams, "
+                         "far cheaper than the full 4096x4096 scene). Ignored if --full is passed.")
+    p.add_argument("--full", action="store_true",
+                    help="run on the full scene instead of a crop. WARNING: main() keeps several full-scene "
+                         "complex128 covariance arrays alive at once (C_ref, C_noisy, plus three more "
+                         "reconstructed via repr_to_cov for the figure) -- on a 4096x4096 scene that's "
+                         "~40GB+ of simultaneous arrays, enough to OOM-kill the process (and in one observed "
+                         "case, the whole tmux session) even with tens of GB nominally free, since the box's "
+                         "free RAM wasn't the full peak the script needs at once. Only pass this if you've "
+                         "confirmed headroom for that burst.")
     args = p.parse_args()
 
     with open(os.path.join(DATA_DIR, "meta.json")) as f:
@@ -133,6 +145,12 @@ def main():
     C_ref, valid_mask, report = build_scene_clean_ref(scene_id)
     H, W = C_ref.shape[:2]
     print(f"  {H}x{W}, hermitian/psd={report['hermitian']}/{report['psd']}")
+
+    if not args.full:
+        c = min(args.crop_size, H, W)
+        C_ref, valid_mask = C_ref[:c, :c], valid_mask[:c, :c]
+        H, W = c, c
+        print(f"  cropped to {H}x{W} top-left (pass --full for the whole scene; see --help for why that risks OOM)")
 
     rng = np.random.default_rng(0)
     print(f"simulating L={args.L} speckle over the full scene ...")
