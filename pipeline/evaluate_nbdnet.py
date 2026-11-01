@@ -19,6 +19,7 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 from . import model as _model  # noqa: F401 -- registers custom layers before load_model
 from .pol_nbdnet import repr_to_cov
+from .polarimetric_eval import evaluate_candidate
 from .visualize import pauli_rgb
 
 DATA_DIR = "pipeline/data/experiment"
@@ -106,6 +107,7 @@ def main():
     model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
 
     results = {}
+    pol_results = {}
     example_tiles = {}
     for L in TEST_L_VALUES:
         d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
@@ -114,8 +116,12 @@ def main():
         denoised = model.predict(noisy, batch_size=64, verbose=0)
 
         noisy_cov = repr_to_cov(noisy, db_min=db_min, db_max=db_max)
-        boxcar_db = cov_span_db(boxcar_filter_cov(noisy_cov))
-        lee_db = cov_span_db(lee_filter_cov(noisy_cov, L=L))
+        boxcar_cov = boxcar_filter_cov(noisy_cov)
+        lee_cov = lee_filter_cov(noisy_cov, L=L)
+        denoised_cov = repr_to_cov(denoised, db_min=db_min, db_max=db_max)
+        clean_cov = repr_to_cov(clean, db_min=db_min, db_max=db_max)
+        boxcar_db = cov_span_db(boxcar_cov)
+        lee_db = cov_span_db(lee_cov)
 
         clean_db = span_db(clean, db_min, db_max)
         noisy_db = span_db(noisy, db_min, db_max)
@@ -149,6 +155,26 @@ def main():
               f"NBDNet {r['denoised_vs_clean']['psnr']:.2f}dB  (+{improvement:.2f}dB vs noisy)  "
               f"SSIM noisy {r['noisy_vs_clean']['ssim']:.3f} -> NBDNet {r['denoised_vs_clean']['ssim']:.3f}")
 
+        # Polarimetric evaluation suite (report.md roadmap Step 1): does the
+        # model preserve the cross-channel structure, not just span PSNR?
+        noisy_span = np.diagonal(noisy_cov, axis1=-2, axis2=-1).real.sum(axis=-1)
+        pol_results[f"L={L}"] = {
+            "noisy_vs_clean": evaluate_candidate(noisy_cov, clean_cov, noisy_span=noisy_span, L=L),
+            "boxcar_vs_clean": evaluate_candidate(boxcar_cov, clean_cov, noisy_span=noisy_span, L=L),
+            "lee_vs_clean": evaluate_candidate(lee_cov, clean_cov, noisy_span=noisy_span, L=L),
+            "denoised_vs_clean": evaluate_candidate(denoised_cov, clean_cov, noisy_span=noisy_span, L=L),
+        }
+        pr = pol_results[f"L={L}"]
+        print(f"  polarimetric: PSD-valid noisy={pr['noisy_vs_clean']['psd_valid_fraction']:.3f} "
+              f"boxcar={pr['boxcar_vs_clean']['psd_valid_fraction']:.3f} "
+              f"lee={pr['lee_vs_clean']['psd_valid_fraction']:.3f} "
+              f"NBDNet={pr['denoised_vs_clean']['psd_valid_fraction']:.3f}  |  "
+              f"H_mae noisy={pr['noisy_vs_clean']['H_mae']:.4f} NBDNet={pr['denoised_vs_clean']['H_mae']:.4f}  |  "
+              f"HHVV-coh-mag_mae noisy={pr['noisy_vs_clean']['hhvv_coh_mag_mae']:.4f} "
+              f"NBDNet={pr['denoised_vs_clean']['hhvv_coh_mag_mae']:.4f}  |  "
+              f"ratio(noisy/NBDNet) mean={pr['denoised_vs_clean']['ratio_mean']:.3f} "
+              f"var={pr['denoised_vs_clean']['ratio_var']:.4f} (expect ~1/{L}={1 / L:.4f})")
+
         mid = n // 2
         example_tiles[L] = {
             "clean": repr_to_cov(clean[mid], db_min=db_min, db_max=db_max),
@@ -159,6 +185,10 @@ def main():
     with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
         json.dump(results, f, indent=2)
     print(f"wrote {RESULTS_DIR}/evaluation.json")
+
+    with open(os.path.join(RESULTS_DIR, "polarimetric_evaluation.json"), "w") as f:
+        json.dump(pol_results, f, indent=2)
+    print(f"wrote {RESULTS_DIR}/polarimetric_evaluation.json")
 
     make_figure(example_tiles, os.path.join(RESULTS_DIR, "evaluation_examples.png"))
     print(f"wrote {RESULTS_DIR}/evaluation_examples.png")

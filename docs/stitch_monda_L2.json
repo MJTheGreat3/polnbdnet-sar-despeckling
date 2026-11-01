@@ -1,0 +1,15 @@
+{
+  "scene": "monda",
+  "L": 2,
+  "shape": [
+    1024,
+    1024
+  ],
+  "tile_size": 64,
+  "stride": 48,
+  "border": 8,
+  "seam_score": 1.0162149399775906,
+  "rmse_db_noisy": 1.8614711726120983,
+  "rmse_db_denoised": 0.391608121097095,
+  "data_range_db": 14.389253569162543
+}
