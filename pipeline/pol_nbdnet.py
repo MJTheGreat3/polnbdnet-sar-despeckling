@@ -6,6 +6,7 @@ pol_nbdnet.py (cov_to_repr / repr_to_cov / simulate_polsar_speckle /
 check_validity / wishart_distance).
 """
 import numpy as np
+import tensorflow as tf
 
 # Placeholders -- overwrite from compute_db_norm_stats() on real training
 # data (valid pixels only) and reuse the same constants everywhere.
@@ -163,3 +164,43 @@ def wishart_distance(C1, C2, eps=1e-8):
 
     term = np.trace(C1_inv @ C2, axis1=-2, axis2=-1) + np.trace(C2_inv @ C1, axis1=-2, axis2=-1)
     return 0.5 * (term.real - 2 * n)
+
+
+def repr_to_cov_tf(repr_tensor, db_min, db_max):
+    """TF-differentiable counterpart of repr_to_cov, for use inside a Keras
+    loss (polarimetric roadmap Step 3). db_min/db_max broadcast against the
+    (..., 3) diagonal channels -- pass per-tile values (not the module-level
+    placeholders) since normalization is fit per scene, not globally."""
+    repr_tensor = tf.cast(repr_tensor, tf.float32)
+    db_min = tf.cast(db_min, tf.float32)
+    db_max = tf.cast(db_max, tf.float32)
+
+    db_norm = repr_tensor[..., :3]
+    coh = repr_tensor[..., 3:]
+    db = db_norm * (db_max - db_min) + db_min
+    diag = tf.cast(tf.pow(10.0, db / 10.0), tf.complex64)  # (..., 3)
+
+    def gamma(k):
+        return tf.complex(coh[..., 2 * k], coh[..., 2 * k + 1])
+
+    c01 = gamma(0) * tf.sqrt(diag[..., 0] * diag[..., 1])
+    c02 = gamma(1) * tf.sqrt(diag[..., 0] * diag[..., 2])
+    c12 = gamma(2) * tf.sqrt(diag[..., 1] * diag[..., 2])
+
+    row0 = tf.stack([diag[..., 0], c01, c02], axis=-1)
+    row1 = tf.stack([tf.math.conj(c01), diag[..., 1], c12], axis=-1)
+    row2 = tf.stack([tf.math.conj(c02), tf.math.conj(c12), diag[..., 2]], axis=-1)
+    return tf.stack([row0, row1, row2], axis=-2)  # (..., 3, 3)
+
+
+def wishart_distance_tf(C1, C2, eps=1e-6):
+    """TF-differentiable counterpart of wishart_distance, batched over any
+    leading dims. Returns per-pixel distance (..., ), caller reduces."""
+    n = C1.shape[-1]
+    eye = tf.eye(n, dtype=tf.complex64) * eps
+
+    C1_inv = tf.linalg.inv(C1 + eye)
+    C2_inv = tf.linalg.inv(C2 + eye)
+
+    term = tf.linalg.trace(C1_inv @ C2) + tf.linalg.trace(C2_inv @ C1)
+    return 0.5 * (tf.math.real(term) - 2 * n)

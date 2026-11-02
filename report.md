@@ -345,6 +345,47 @@ Plan: pull multi-crop extractions from each of the 6 `use` sites (same `batch_pu
 
 ---
 
+# Week 4 — 2026-11-01: Polarimetric improvements roadmap + evaluation suite
+
+A 10-step roadmap (`docs/PolNBDNet_Polarimetric_Improvements_Step_by_Step-1.pdf`) takes the pipeline from the current flat 9-channel MSE model to a polarimetry-preserving, publishable despeckler: (1) polarimetric evaluation suite, (2) Cholesky output head for guaranteed-valid covariance, (3) polarimetric (Wishart) loss, (4) better target/realistic noise, (5) L-conditioning, (6) multiscale architecture, (7) full-data training protocol, (8) multi-sensor support, (9) real-data + downstream task evaluation, (10) ablations. Steps 7-10 are paper-level and out of scope for now; started on 1 and 3, since both had partial groundwork already in the repo (`pol_nbdnet.wishart_distance` existed but was unwired; `checklist.py` already did a batch Hermitian/PSD check).
+
+## 4.1 Polarimetric evaluation suite (Step 1)
+
+Added `pipeline/polarimetric_eval.py`: H/A/α (entropy, anisotropy, mean alpha angle from the coherency-matrix eigendecomposition, computed in the correct Pauli basis via the lexicographic→Pauli unitary transform), HH–VV complex coherence (magnitude + phase), a per-pixel PSD-validity fraction, ENL, and the ratio-image self-consistency check (noisy/candidate should look like pure speckle: mean≈1, var≈1/L). Wired into `evaluate_nbdnet.py`, run per L against noisy/boxcar/Lee/NBDNet; writes `pipeline/results/polarimetric_evaluation.json`.
+
+Sanity-checked standalone first against synthetic PSD matrices before trusting it on real output: self-consistency case (candidate==reference) gives exactly 0 error on every metric, and injecting one broken matrix into a batch of 500 correctly drops the validity fraction from 1.0 to 0.998.
+
+Real run on the trained model, test scene (`monda`), all 4 L:
+
+| L | H_mae noisy→NBDNet | HHVV-coh-mag_mae noisy→NBDNet | PSD-valid (all candidates) | ratio mean | ratio var (expected 1/L) |
+|---|---|---|---|---|---|
+| 1 | 0.569 → 0.044 | 0.456 → 0.054 | 1.000 | 1.141 | 0.964 (1.000) |
+| 2 | 0.322 → 0.035 | 0.279 → 0.042 | 1.000 | 1.114 | 0.437 (0.500) |
+| 4 | 0.169 → 0.024 | 0.179 → 0.032 | 1.000 | 1.094 | 0.203 (0.250) |
+| 8 | 0.092 → 0.018 | 0.120 → 0.026 | 1.000 | 1.108 | 0.102 (0.125) |
+
+Findings:
+- **Polarimetry is genuinely preserved, not just span.** Entropy error drops ~8-13x and HH-VV coherence-magnitude error drops ~5-8x from noisy to NBDNet at every L — consistent with the large SSIM gains already seen on span, but this is the first direct evidence the cross-channel structure survives too, not only the brightness image.
+- **Output covariance is always valid on this data** — PSD-valid fraction is 1.000 for every candidate (including NBDNet) at every L. Step 2's Cholesky head would still be worth doing as a hard guarantee (current validity is empirical, not structural — nothing stops it breaking on a different scene/noise regime), but it's not fixing an observed problem on this test scene.
+- **Small systematic brightness bias.** Ratio mean sits at ~1.09-1.14 instead of ~1.0 at every L — NBDNet's output span is consistently ~10-14% dimmer than the noisy input's mean, a small but consistent bias worth investigating (possibly related to item #5 below, the L=8 PSNR crossover with classical filters).
+- **Ratio variance tracks the 1/L prediction reasonably** (slightly under at L=2,4,8, close at L=1) — the model removes roughly the expected amount of speckle variance without obviously over-smoothing texture out of the ratio image.
+
+## 4.2 Polarimetric (Wishart) loss — wired, not yet trained
+
+Added `repr_to_cov_tf` / `wishart_distance_tf` to `pol_nbdnet.py` -- TF-differentiable counterparts of the existing numpy `repr_to_cov`/`wishart_distance`, batched over arbitrary leading dims. `train_nbdnet.py`'s loss is now MSE + `--wishart-weight` * Wishart divergence between the reconstructed predicted/target covariances (Step 3), gated behind a new `--wishart-weight` flag that defaults to `0.0` -- original MSE-only behavior unchanged unless explicitly opted into.
+
+One wrinkle: the Wishart term needs the *physical* covariance, which requires decoding each tile's repr with its own scene's `db_min`/`db_max` (normalization is deliberately per-scene, not global -- CLAUDE.md). Since training batches mix tiles from different scenes, `make_dataset()` now appends each tile's `(db_min, db_max)` as 2 extra broadcast channels onto the target array (9 repr channels -> 11), used only by the Wishart term; plain MSE slices them off and ignores them.
+
+Verified before trusting it in a real run:
+- `repr_to_cov_tf` vs the existing numpy `repr_to_cov` on random reprs: exact match (0.0 max abs diff).
+- `wishart_distance_tf` vs numpy `wishart_distance`: relative error ~1e-7 (float32 vs float64, as expected).
+- `make_loss(0.0)` reproduces plain MSE exactly (backward compatibility with all prior runs confirmed).
+- `make_loss(0.1)` on predicted==target gives ~0 loss, and produces finite, non-zero gradients w.r.t. the prediction (checked via `tf.GradientTape`) -- the new term is actually differentiable and won't silently no-op or NaN the graph.
+
+Not yet trained or evaluated against the Step 1 polarimetric metrics -- next real GPU run should sweep `--wishart-weight` (doc suggests starting ~0.05-0.1) and compare H/A/coherence errors and PSNR against the Week 4.1 MSE-only baseline.
+
+---
+
 # Open items (current, across all weeks)
 
 1. ~~**Normalization domain-shift risk.**~~ **Resolved (2026-10-15, Week 2).** Switched from a single train-scene-fit global dB range to per-scene percentile normalization. Not re-verified in isolation whether this specifically fixed the #2628/#3628 blob artifacts from Week 1 — the scale-up run changed multiple things at once (normalization + 126x more data), so the artifact's exact cause is still not isolated. Worth a follow-up: re-run eval on a held-out Howland tile specifically to confirm.
