@@ -193,14 +193,33 @@ def repr_to_cov_tf(repr_tensor, db_min, db_max):
     return tf.stack([row0, row1, row2], axis=-2)  # (..., 3, 3)
 
 
+def _inv3x3(M):
+    """Closed-form 3x3 complex matrix inverse (adjugate/determinant),
+    batched over any leading dims. tf.linalg.inv has no XLA GPU kernel for
+    complex64 (MatrixInverse unsupported on XLA_GPU_JIT, hit when this is
+    used inside a training loss -- Keras 3 jit-compiles by default) --
+    plain arithmetic ops like this are XLA-compatible."""
+    a, b, c = M[..., 0, 0], M[..., 0, 1], M[..., 0, 2]
+    d, e, f = M[..., 1, 0], M[..., 1, 1], M[..., 1, 2]
+    g, h, i = M[..., 2, 0], M[..., 2, 1], M[..., 2, 2]
+
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+    row0 = tf.stack([e * i - f * h, c * h - b * i, b * f - c * e], axis=-1)
+    row1 = tf.stack([f * g - d * i, a * i - c * g, c * d - a * f], axis=-1)
+    row2 = tf.stack([d * h - e * g, b * g - a * h, a * e - b * d], axis=-1)
+    adj_t = tf.stack([row0, row1, row2], axis=-2)  # already transposed (= adjugate)
+    return adj_t / det[..., None, None]
+
+
 def wishart_distance_tf(C1, C2, eps=1e-6):
     """TF-differentiable counterpart of wishart_distance, batched over any
     leading dims. Returns per-pixel distance (..., ), caller reduces."""
     n = C1.shape[-1]
     eye = tf.eye(n, dtype=tf.complex64) * eps
 
-    C1_inv = tf.linalg.inv(C1 + eye)
-    C2_inv = tf.linalg.inv(C2 + eye)
+    C1_inv = _inv3x3(C1 + eye)
+    C2_inv = _inv3x3(C2 + eye)
 
     term = tf.linalg.trace(C1_inv @ C2) + tf.linalg.trace(C2_inv @ C1)
     return 0.5 * (tf.math.real(term) - 2 * n)
