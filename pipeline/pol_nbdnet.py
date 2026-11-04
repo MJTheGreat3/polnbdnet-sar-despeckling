@@ -175,13 +175,30 @@ def repr_to_cov_tf(repr_tensor, db_min, db_max):
     db_min = tf.cast(db_min, tf.float32)
     db_max = tf.cast(db_max, tf.float32)
 
-    db_norm = repr_tensor[..., :3]
+    # cov_to_repr clips db_norm to [0,1] on encode, but y_pred (the network's
+    # raw output_image, activation=None) has no such constraint -- an
+    # untrained/diverging net can emit db_norm far outside [0,1], and
+    # 10**(db/10) overflows float32 to inf within a few units of db_norm>1
+    # (this is the actual cause of a real "Invalid loss" crash at
+    # --wishart-weight 0.1, batch 59 -- not just the coh clipping below).
+    # Clip to the only physically valid range, matching the encode side.
+    db_norm = tf.clip_by_value(repr_tensor[..., :3], 0.0, 1.0)
     coh = repr_tensor[..., 3:]
     db = db_norm * (db_max - db_min) + db_min
     diag = tf.cast(tf.pow(10.0, db / 10.0), tf.complex64)  # (..., 3)
 
     def gamma(k):
-        return tf.complex(coh[..., 2 * k], coh[..., 2 * k + 1])
+        # |gamma_ij| <= 1 for any physical covariance matrix, but y_pred has
+        # no such constraint (output_image has activation=None, model.py) --
+        # early in training an untrained net emits coh values with
+        # |gamma| >> 1, making C ill-conditioned/non-PSD and blowing up
+        # wishart_distance_tf's inverse to inf (killed a real training run
+        # at --wishart-weight 0.1, batch 59, "Invalid loss"). Clip magnitude,
+        # keep phase -- no-op for already-valid targets/ground truth.
+        g = tf.complex(coh[..., 2 * k], coh[..., 2 * k + 1])
+        mag = tf.abs(g)
+        scale = tf.cast(tf.minimum(1.0, 1.0 / tf.maximum(mag, 1e-12)), tf.complex64)
+        return g * scale
 
     c01 = gamma(0) * tf.sqrt(diag[..., 0] * diag[..., 1])
     c02 = gamma(1) * tf.sqrt(diag[..., 0] * diag[..., 2])
