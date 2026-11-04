@@ -130,14 +130,18 @@ def main():
     print(f"train: {n_train_tiles} tiles from {n_train_shards} scene(s) ({steps_per_epoch} steps/epoch), "
           f"val: {n_val_tiles} tiles from {n_val_shards} scene(s) ({validation_steps} steps)")
 
-    # clipnorm is scoped to --mixed-precision only -- it's a safety net against
-    # a late-training activation/gradient spike overflowing fp16's narrow range
-    # (the loss-scale optimizer only guards gradient under/overflow, not a
-    # forward-pass activation blowing past fp16 max and turning the loss
-    # itself to NaN, which is what happened at epoch 3 of the first attempt).
-    # Left off for fp32 to not disturb the already-reported baseline numbers.
+    # clipnorm is a safety net against a gradient spike turning the loss to
+    # NaN. Originally scoped to --mixed-precision only (fp16 activation
+    # overflow, epoch 3 of the first attempt) -- also needed for
+    # --wishart-weight > 0: the Wishart term's gradient gets steep near
+    # ill-conditioned covariance matrices, and even with repr_to_cov_tf's
+    # [0,1]/|gamma|<=1 clamping (pol_nbdnet.py) on the *representation*, nothing
+    # bounds how far raw network weights drift step to step -- a real run
+    # reached "Invalid loss, terminating training" (loss: nan) at batch 1825
+    # without this. Left off for plain-MSE fp32 to not disturb the
+    # already-reported baseline numbers.
     opt_kwargs = {"learning_rate": args.lr}
-    if args.mixed_precision:
+    if args.mixed_precision or args.wishart_weight > 0:
         opt_kwargs["clipnorm"] = 1.0
     model = build_nbdnet(TILE_SHAPE)
     model.compile(optimizer=keras.optimizers.Adam(**opt_kwargs), loss=make_loss(args.wishart_weight))
