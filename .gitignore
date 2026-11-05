@@ -4,6 +4,10 @@ pipeline/data/
 # trained weights (regeneratable via pipeline/train_nbdnet.py)
 pipeline/results/*.keras
 
+# per-run archive (train_nbdnet.py/evaluate_nbdnet.py RUNS_DIR) -- each run's .keras
+# checkpoint makes this grow unbounded; history/config json are small but travel with it
+pipeline/results/runs/
+
 # python
 __pycache__/
 *.pyc

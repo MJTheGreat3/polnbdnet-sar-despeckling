@@ -12,9 +12,11 @@ training set size is bounded by disk, not RAM -- the thing that actually
 lets you add more scenes on a bigger box without hitting a wall.
 """
 import argparse
+import datetime
 import glob
 import json
 import os
+import shutil
 import time
 
 import numpy as np
@@ -26,6 +28,12 @@ from .pol_nbdnet import repr_to_cov_tf, wishart_distance_tf
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"
+# Every run writes the canonical pipeline/results/{nbdnet_model.keras,train_history.json}
+# too (evaluate_nbdnet.py/make_before_after.py/stitch_scene.py hardcode those paths and
+# always read "the latest run") -- RUNS_DIR is a parallel, never-overwritten archive per
+# run (model + history + the hyperparams used) so multiple training attempts can be
+# compared later instead of each one clobbering the last.
+RUNS_DIR = os.path.join(RESULTS_DIR, "runs")
 TILE_SHAPE = (64, 64, 9)
 # targets carry 2 extra channels (per-tile db_min/db_max, broadcast constants)
 # beyond the 9 repr channels -- only consumed by the Wishart loss term
@@ -109,12 +117,27 @@ def main():
                     help="polarimetric roadmap Step 3: weight of the Wishart-divergence loss term added "
                          "to MSE (0 = disabled, original MSE-only behavior). Doc recommends starting small "
                          "(e.g. 0.05-0.1) and ramping up while watching Step 1's polarimetric eval metrics.")
+    p.add_argument("--run-name", default=None,
+                    help="tag for this run's archived copy under pipeline/results/runs/<run-name>/ "
+                         "(model + history + the hyperparams used) -- default is a timestamp + wishart "
+                         "weight, e.g. 20261105_143200_w0.1. Doesn't affect the canonical "
+                         "pipeline/results/nbdnet_model.keras that other scripts read.")
     args = p.parse_args()
+
+    run_id = args.run_name or (
+        datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_w{args.wishart_weight}"
+    )
+    run_dir = os.path.join(RUNS_DIR, run_id)
 
     if args.mixed_precision:
         keras.mixed_precision.set_global_policy("mixed_float16")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
+    # written up front (not just at the end) so the hyperparams survive even if the
+    # process dies outright (OOM-kill etc.) partway through, not just a clean exit
+    with open(os.path.join(run_dir, "run_config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
 
     with open(os.path.join(DATA_DIR, "meta.json")) as f:
         meta = json.load(f)
@@ -174,6 +197,15 @@ def main():
         json.dump(hist, f, indent=2)
 
     model.save(ckpt_path)
+
+    # archive this run's model + history alongside run_config.json (written earlier) --
+    # the canonical RESULTS_DIR files above still get overwritten every run as before,
+    # this is the non-overwritten copy for comparing runs later.
+    with open(os.path.join(run_dir, "train_history.json"), "w") as f:
+        json.dump(hist, f, indent=2)
+    shutil.copy2(ckpt_path, os.path.join(run_dir, "nbdnet_model.keras"))
+    print(f"archived this run to {run_dir}/")
+
     print(f"done in {elapsed:.1f}s, {hist['epochs_ran']} epochs, "
           f"final val_loss={hist['val_loss'][-1]:.5f} (best saved to {ckpt_path})")
 

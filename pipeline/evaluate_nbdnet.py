@@ -8,6 +8,8 @@ the paper's own Table 1 evaluation. Answers: how effective is the
 pipeline's Wishart-noise route, and does effectiveness hold up as L
 (noise severity) changes.
 """
+import argparse
+import datetime
 import json
 import os
 
@@ -24,6 +26,9 @@ from .visualize import pauli_rgb
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"
+# see train_nbdnet.py's RUNS_DIR comment -- same per-run archive scheme, so a run's
+# training history and its evaluation results end up side by side under one run_id.
+RUNS_DIR = os.path.join(RESULTS_DIR, "runs")
 TEST_L_VALUES = (1, 2, 4, 8)
 BASELINE_WINDOW = 7
 
@@ -96,6 +101,25 @@ def compute_metrics(clean_db, other_db, data_range):
 
 
 def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default=os.path.join(RESULTS_DIR, "nbdnet_model.keras"),
+                    help="which .keras checkpoint to evaluate -- defaults to the canonical "
+                         "(most-recently-trained) model, but can point at an archived "
+                         "pipeline/results/runs/<run-id>/nbdnet_model.keras to evaluate an older run.")
+    p.add_argument("--run-name", default=None,
+                    help="tag for this evaluation's archived copy under pipeline/results/runs/<tag>/ "
+                         "-- default: reuse the run-id from --model if it's an archived checkpoint, "
+                         "else a timestamp. Doesn't affect the canonical pipeline/results/evaluation.json.")
+    args = p.parse_args()
+
+    run_id = args.run_name
+    if run_id is None:
+        model_dir = os.path.basename(os.path.dirname(os.path.abspath(args.model)))
+        in_runs_dir = os.path.dirname(os.path.dirname(os.path.abspath(args.model))) == os.path.abspath(RUNS_DIR)
+        run_id = model_dir if in_runs_dir else datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_eval"
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
     with open(os.path.join(DATA_DIR, "meta.json")) as f:
         meta = json.load(f)
     test_scenes = meta["scenes"]["test"]
@@ -104,7 +128,7 @@ def main():
                                    "per-tile scene tracking would be needed for more than one")
     db_min, db_max = meta["per_scene_norm"][test_scenes[0]]
 
-    model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
+    model = keras.models.load_model(args.model)
 
     results = {}
     pol_results = {}
@@ -190,8 +214,18 @@ def main():
         json.dump(pol_results, f, indent=2)
     print(f"wrote {RESULTS_DIR}/polarimetric_evaluation.json")
 
-    make_figure(example_tiles, os.path.join(RESULTS_DIR, "evaluation_examples.png"))
-    print(f"wrote {RESULTS_DIR}/evaluation_examples.png")
+    eval_fig_path = os.path.join(RESULTS_DIR, "evaluation_examples.png")
+    make_figure(example_tiles, eval_fig_path)
+    print(f"wrote {eval_fig_path}")
+
+    # archived copies, keyed by run_id (see RUNS_DIR comment) -- canonical RESULTS_DIR
+    # files above still get overwritten every run as before.
+    with open(os.path.join(run_dir, "evaluation.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    with open(os.path.join(run_dir, "polarimetric_evaluation.json"), "w") as f:
+        json.dump(pol_results, f, indent=2)
+    make_figure(example_tiles, os.path.join(run_dir, "evaluation_examples.png"))
+    print(f"archived this evaluation to {run_dir}/")
 
 
 def make_figure(example_tiles, out_path):

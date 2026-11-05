@@ -14,31 +14,13 @@ This report is organized week by week — each section below is a self-contained
 
 The preprocessing pipeline (built earlier, reused today) implements the 13-step guide for turning raw polarimetric SAR SLC data into despeckling training pairs:
 
-```mermaid
-flowchart LR
-    A[Raw SLC<br/>HH/HV/VH/VV] --> B[Mask invalid<br/>pixels]
-    B --> C[Build 3x3<br/>covariance C]
-    C --> D[Clean reference<br/>C_ref<br/>large-window multilook]
-    D --> E[Wishart-simulate<br/>noisy C<br/>at look-count L]
-    D --> F[9-channel<br/>representation]
-    E --> F
-    F --> G[Tile into<br/>64x64x9 pairs]
-    G --> H[Scene-level<br/>train/val/test split]
-```
+![Preprocessing pipeline](docs/diagrams/diag1_pipeline.png){width=100%}
 
 `C_ref` (step D) stands in for the unobservable "true" speckle-free signal. `simulate_polsar_speckle` (step E) draws correlated noise from the complex Wishart distribution — the polarimetrically-correct way to inject synthetic speckle, preserving cross-channel phase instead of corrupting each channel independently.
 
 ## 1.2 What we did
 
-```mermaid
-flowchart TD
-    S1[1. Set up TensorFlow +<br/>Metal GPU on Apple Silicon] --> S2[2. Pull 3 real SLC crops<br/>from 3 distinct flight lines]
-    S2 --> S3[3. Build clean references<br/>+ Wishart-noisy tiles<br/>per look-count L]
-    S3 --> S4[4. Implement NBDNet<br/>architecture in Keras]
-    S4 --> S5[5. Train on mixed<br/>L in 1,2,4]
-    S5 --> S6[6. Evaluate on held-out<br/>scene at fixed L = 1,2,4,8]
-    S6 --> S7[7. Report results]
-```
+![Week 1 workflow](docs/diagrams/diag2_steps.png){height=7.5in}
 
 ### Environment
 
@@ -48,12 +30,7 @@ Apple M4, macOS, 16GB RAM. TensorFlow 2.21 on the default Python 3.13 had no wor
 
 ASF (the standard public UAVSAR archive) does not host raw SLC — confirmed earlier by scanning all 12,521 UAVSAR granules there; zero have a `.slc` file. Real raw quad-pol SLC turned out to be available from JPL directly, packaged in **NISAR-format HDF5** (a different container format than the classic UAVSAR flat-binary `.slc`, used because JPL is validating NISAR's ground-processing pipeline against UAVSAR data ahead of the NISAR satellite's launch):
 
-```mermaid
-flowchart LR
-    J["JPL download-files.pl<br/>LBand-RSLC .h5 files<br/>(41-118GB each, chunked HDF5)"] -->|HTTP range reads<br/>via h5py+fsspec,<br/>no full download needed| K[nisar_to_legacy.py<br/>crop converter]
-    K -->|writes 4096x4096 crop| L["legacy .ann + .slc<br/>(what the pipeline expects)"]
-    L --> M[existing pipeline,<br/>unmodified]
-```
+![NISAR HDF5 -> legacy conversion flow](docs/diagrams/diag3_nisar.png){width=100%}
 
 Because a full flight line is ~1.8 billion pixels (far too large to hold in memory for the dense covariance/Wishart steps), only a 4096×4096 crop was pulled from each of 3 **genuinely distinct real sites** — chosen specifically so no spatial/scene overlap is possible:
 
@@ -81,28 +58,12 @@ dB normalization range (`db_min=-19.88`, `db_max=-4.82`) was fit on the **train 
 
 Reconstructed from the paper's Fig. 1–4 (the paper doesn't give numeric layer configs beyond what's drawn, so this is a best-effort faithful implementation), adapted for the pipeline's 9-channel representation instead of the paper's single-channel SAR intensity:
 
-```mermaid
-flowchart TD
-    subgraph NE["Noise Estimation Subnetwork"]
-        I[Noisy input<br/>64x64x9] --> N1[Conv 32 x3]
-        N1 --> N2[Estimated noise<br/>64x64x9]
-    end
-
-    I --> CAT[Concatenate]
-    N2 --> CAT
-
-    subgraph NBD["Non-Blind Denoising Subnetwork"]
-        CAT --> C64a[Conv 64] --> SE1[Squeeze-Excitation] --> CB1[CBAM]
-        CB1 --> C128[Conv 128 - skip saved]
-        C128 --> C256[Conv 256 x2 bottleneck]
-        C256 --> PROJ[Conv 128 projection]
-        PROJ --> ADD((+ skip))
-        C128 -.skip connection.-> ADD
-        ADD --> SE2[Squeeze-Excitation] --> CB2[CBAM]
-        CB2 --> C64b[Conv 64] --> SE3[Squeeze-Excitation] --> CB3[CBAM]
-        CB3 --> C64c[Conv 64]
-        C64c --> OUT[Output image<br/>64x64x9]
-    end
+```{=latex}
+\begin{landscape}
+```
+![NBDNet architecture](docs/diagrams/diag4_model.png){width=95%}
+```{=latex}
+\end{landscape}
 ```
 
 - **Squeeze-Excitation**: global-pool → FC → FC → sigmoid channel gate
@@ -115,33 +76,15 @@ flowchart TD
 
 Adam optimizer, lr=0.001 (paper's setting), batch size 32, up to 20 epochs with `ReduceLROnPlateau` and `EarlyStopping` (best weights restored). Ran 3,130s (~52 min) on the M4 GPU.
 
-```mermaid
-xychart-beta
-    title "Training loss by epoch"
-    x-axis [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
-    y-axis "MSE loss" 0 --> 0.1
-    line [0.0406,0.0086,0.0077,0.0066,0.0058,0.0051,0.0050,0.0048,0.0045,0.0043,0.0046,0.0041,0.0038,0.0038,0.0037,0.0039,0.0036,0.0035,0.0035,0.0035]
-    line [0.0867,0.0560,0.0272,0.0144,0.0106,0.0069,0.0062,0.0056,0.0051,0.0054,0.0055,0.0056,0.0038,0.0039,0.0040,0.0044,0.0035,0.0034,0.0033,0.0033]
-```
-*(top line: training loss, bottom line: validation loss — learning rate halved at epochs 13 and 17 via plateau detection)*
+![Training loss by epoch](docs/diagrams/chart_week1_loss.png){width=90%}
+
+*(dashed lines mark the epochs where learning rate was halved via plateau detection)*
 
 Final: train loss 0.0035, val loss 0.0033 — no overfitting (val tracked train closely throughout).
 
 ## 1.5 Evaluation design
 
-```mermaid
-flowchart LR
-    CR[Test scene C_ref<br/>monda, 3844 tiles] --> W1[Wishart L=1]
-    CR --> W2[Wishart L=2]
-    CR --> W4[Wishart L=4]
-    CR --> W8[Wishart L=8]
-    W1 & W2 & W4 & W8 --> M[Trained NBDNet]
-    M --> P[Denoised output]
-    CR -.ground truth.-> CMP{Compare}
-    P --> CMP
-    W1 & W2 & W4 & W8 -.baseline.-> CMP
-    CMP --> R[PSNR / SSIM / RMSE / CC<br/>on reconstructed span-power dB image]
-```
+![Evaluation design](docs/diagrams/diag6_eval.png){width=100%}
 
 Metrics computed on the reconstructed total-power ("span") image in dB — the standard single-channel SAR representative image, same idea as the paper's own Table 1 evaluation — comparing both the raw noisy input and the model's output against the clean reference.
 
@@ -154,19 +97,15 @@ Metrics computed on the reconstructed total-power ("span") image in dB — the s
 | 4 | 24.58 dB | 28.63 dB | **+4.05 dB** | 0.379 | 0.811 | 0.560 → 0.624 |
 | 8 (mild) | 27.41 dB | 28.88 dB | **+1.47 dB** | 0.510 | 0.831 | 0.658 → 0.644 |
 
-```mermaid
-xychart-beta
-    title "PSNR improvement vs noise severity"
-    x-axis ["L=1", "L=2", "L=4", "L=8"]
-    y-axis "PSNR improvement (dB)" 0 --> 7
-    bar [6.56, 5.84, 4.05, 1.47]
-```
+![PSNR improvement vs noise severity](docs/diagrams/chart_week1_psnr_gain.png){width=75%}
 
 ### Before / after examples
 
 Five different, randomly-picked test tiles at L=1 (the most severe noise level, where despeckling matters most) — before (noisy input), after (NBDNet output), and ground truth (C_ref) side by side:
 
-<img src="/Users/mj/IIITB/Sem_7/GIS/pipeline/results/before_after_examples.png" alt="before-after" style="max-height:1000px;" />
+![Before/after examples, Week 1](pipeline/results/before_after_examples.png){height=7.8in}
+
+*(note: `before_after_examples.png` is regenerated in place by `make_before_after.py` -- this file's on-disk timestamp is from the Week 2 scale-up run, so this image actually shows the scale-up model's output, not the original 3-scene Week 1 model. The Week 1-specific image wasn't preserved separately.)*
 
 The speckle removal is visually obvious (grainy noise gone in every example). The oversmoothing caveat is also visible here directly: tiles #2628 and #3628 show faint blob/loop-shaped artifacts in the output that aren't present in the ground truth — a concrete instance of the texture-loss limitation discussed below.
 
@@ -244,19 +183,11 @@ Mixed-precision (fp16) was tried first and produced NaN loss within 2 epochs —
 | 4 | 0.573 | 0.935 | 0.920 | **0.940** |
 | 8 | 0.677 | **0.957** | 0.947 | 0.949 |
 
-```mermaid
-xychart-beta
-    title "PSNR by method vs look count"
-    x-axis ["L=1", "L=2", "L=4", "L=8"]
-    y-axis "PSNR (dB)" 15 --> 42
-    line [18.35, 21.75, 25.02, 28.17]
-    line [32.28, 35.50, 38.10, 40.02]
-    line [31.66, 34.89, 37.57, 39.62]
-    line [34.40, 35.50, 36.21, 35.89]
-```
-*(bottom to top at L=8: noisy, Lee, boxcar, NBDNet — NBDNet leads at L=1–2, falls behind boxcar/Lee at L=4,8)*
+![PSNR by method vs look count](docs/diagrams/chart_week2_psnr_by_method.png){width=90%}
 
-<img src="/Users/mj/IIITB/Sem_7/GIS/pipeline/results/before_after_examples.png" alt="before-after, scale-up model" style="max-height:1000px;" />
+*(NBDNet leads at L=1-2, falls behind boxcar/Lee at L=4,8 — see legend)*
+
+![Before/after examples, scale-up model](pipeline/results/before_after_examples.png){height=7.8in}
 
 ## 2.4 Insights
 
@@ -307,37 +238,41 @@ All four seam scores sit at ~1.0–1.02 — no detectable grid-line artifact at 
 Each figure below is the full-scene Pauli RGB triptych (clean / noisy / denoised) plus a zoomed-in panel at the first tile-stitch boundary with reference lines marking the seam:
 
 **L=1:**
-<img src="docs/stitch_monda_L1.png" alt="stitch check, L=1" style="max-height:900px;" />
+
+![Stitch check, L=1](docs/stitch_monda_L1.png){width=100%}
 
 **L=2:**
-<img src="docs/stitch_monda_L2.png" alt="stitch check, L=2" style="max-height:900px;" />
+
+![Stitch check, L=2](docs/stitch_monda_L2.png){width=100%}
 
 **L=4:**
-<img src="docs/stitch_monda_L4.png" alt="stitch check, L=4" style="max-height:900px;" />
+
+![Stitch check, L=4](docs/stitch_monda_L4.png){width=100%}
 
 **L=8:**
-<img src="docs/stitch_monda_L8.png" alt="stitch check, L=8" style="max-height:900px;" />
+
+![Stitch check, L=8](docs/stitch_monda_L8.png){width=100%}
 
 ## 3.3 Next: terrain-diversity data gathering
 
-Train/val/test so far are all drawn from two UAVSAR campaigns — BERMS (boreal wetland/forest, Saskatchewan) and `monda` — so the model has never seen several common terrain types. Surveyed 14 candidate UAVSAR "Coregistered SLC stack" product pages (raw SLC confirmed present, not InSAR-pair-only derived products, which ship no raw SLC at all) across quad-pol (HH/HV/VH/VV) sites outside the current campaigns. Each row's `.ann` URL below was pulled directly out of the real product page (`docs/sources/*.pdf`) via `pdftotext` — not guessed; `curl -I` on any of them returns `200`. The matching 4 `.slc` files sit next to it with the same filename stem, one per polarization, `_s1_1x1.slc` instead of `.ann`.
+Train/val/test so far are all drawn from two UAVSAR campaigns — BERMS (boreal wetland/forest, Saskatchewan) and `monda` — so the model has never seen several common terrain types. Surveyed 14 candidate UAVSAR "Coregistered SLC stack" product pages (raw SLC confirmed present, not InSAR-pair-only derived products, which ship no raw SLC at all) across quad-pol (HH/HV/VH/VV) sites outside the current campaigns. Each row's `.ann` URL below was pulled directly out of the real product page (`docs/sources/*.pdf`) via `pdftotext` — not guessed; `curl -I` on any of them returns `200`. The matching 4 `.slc` files sit next to it with the same filename stem, one per polarization, `_s1_1x1.slc` instead of `.ann`. All paths below are relative to `downloaduav2.jpl.nasa.gov/` (omitted per-row for width).
 
-| Site | Terrain/location | Verdict | Verified `.ann` URL (HH, first track) |
+| Site | Terrain/location | Verdict | Verified `.ann` path (HH, first track), relative to `downloaduav2.jpl.nasa.gov/` |
 |---|---|---|---|
-| `rockmt_14107` | Rocky Mountains NP, CO — alpine | **use** | `downloaduav2.jpl.nasa.gov/Release32/rockmt_14107_01/rockmt_14107_20005_009_200212_L090HH_01_BU.ann` |
-| `cvalle_32524` | Central Valley, CA — agricultural | **use** | `downloaduav2.jpl.nasa.gov/Release33/cvalle_32524_01/cvalle_32524_23007_005_230629_L090HH_01_BC.ann` |
-| `barrow_15018` | Barrow Legacy Line, AK — Arctic coastal tundra | **use** | `downloaduav2.jpl.nasa.gov/Release34/barrow_15018_01/barrow_15018_17069_003_170621_L090HH_01_BC.ann` |
-| `atchaf_06309` | Atchafalaya River Delta, LA — subtropical wetland | **use** | `downloaduav2.jpl.nasa.gov/Release27/atchaf_06309_02/atchaf_06309_21023_001_210327_L090HH_02_BU.ann` |
-| `dorado_34017` | Eldorado National Forest, CA — Sierra montane forest | **use** | `downloaduav2.jpl.nasa.gov/Release28/dorado_34017_01/dorado_34017_20002_002_200131_L090HH_01_BU.ann` |
-| `stlake_27129` | Salt Lake City, UT — urban/mountain valley | **use** | `downloaduav2.jpl.nasa.gov/Release31/stlake_27129_01/stlake_27129_20007_004_200213_L090HH_01_BC.ann` |
-| `trinit_14940` | Trinity River, TX — river/Gulf coastal plain | maybe | `downloaduav2.jpl.nasa.gov/Release28/trinit_14940_01/trinit_14940_17087_010_170831_L090HH_01_BC.ann` |
-| `uticam_21003` | Utica, MT — plains/prairie | maybe | `downloaduav2.jpl.nasa.gov/Release20/uticam_21003_01/uticam_21003_21002_003_210115_L090HH_01_BC.ann` |
-| `aklavi_25702` | Aklavik Highway, NWT Canada — Arctic tundra (ABoVE) | skip (redundant w/ `barrow`) | `downloaduav2.jpl.nasa.gov/Release31/aklavi_25702_01/aklavi_25702_17070_003_170622_L090HH_01_BC.ann` |
-| `anaktW_16405` | Anaktuvuk Burn Scar West, AK — Arctic tundra burn scar | skip (redundant w/ `barrow`) | `downloaduav2.jpl.nasa.gov/Release24/anaktW_16405_01/anaktW_16405_17069_005_170621_L090HH_01_BC.ann` |
-| `atchaf_19809` | Atchafalaya Delta, LA (different track, same site) | skip (dup of `atchaf_06309`) | `downloaduav2.jpl.nasa.gov/Release30/atchaf_19809_02/atchaf_19809_21023_000_210327_L090HH_02_BU.ann` |
-| `wterre_16300` | West Terrebonne Basin, LA — coastal wetland/bayou | skip (dup LA wetland bucket) | `downloaduav2.jpl.nasa.gov/Release31/wterre_16300_02/wterre_16300_21026_000_210405_L090HH_02_BU.ann` |
-| `NISARP_20706` | Yucatan Lake, LA — lake/wetland | skip (dup LA wetland bucket) | `downloaduav2.jpl.nasa.gov/Release31/NISARP_20706_01/NISARP_20706_19040_011_190622_L090HH_01_BU.ann` |
-| `alamos_35915` | Los Alamos, NM — montane forest/sagebrush | skip (dup of `dorado`, smaller) | `downloaduav2.jpl.nasa.gov/Release20/alamos_35915_04/alamos_35915_20005_003_200212_L090HH_04_BU.ann` |
+| `rockmt_14107` | Rocky Mountains NP, CO — alpine | **use** | `Release32/rockmt_14107_01/rockmt_14107_20005_009_200212_L090HH_01_BU.ann` |
+| `cvalle_32524` | Central Valley, CA — agricultural | **use** | `Release33/cvalle_32524_01/cvalle_32524_23007_005_230629_L090HH_01_BC.ann` |
+| `barrow_15018` | Barrow Legacy Line, AK — Arctic coastal tundra | **use** | `Release34/barrow_15018_01/barrow_15018_17069_003_170621_L090HH_01_BC.ann` |
+| `atchaf_06309` | Atchafalaya River Delta, LA — subtropical wetland | **use** | `Release27/atchaf_06309_02/atchaf_06309_21023_001_210327_L090HH_02_BU.ann` |
+| `dorado_34017` | Eldorado National Forest, CA — Sierra montane forest | **use** | `Release28/dorado_34017_01/dorado_34017_20002_002_200131_L090HH_01_BU.ann` |
+| `stlake_27129` | Salt Lake City, UT — urban/mountain valley | **use** | `Release31/stlake_27129_01/stlake_27129_20007_004_200213_L090HH_01_BC.ann` |
+| `trinit_14940` | Trinity River, TX — river/Gulf coastal plain | maybe | `Release28/trinit_14940_01/trinit_14940_17087_010_170831_L090HH_01_BC.ann` |
+| `uticam_21003` | Utica, MT — plains/prairie | maybe | `Release20/uticam_21003_01/uticam_21003_21002_003_210115_L090HH_01_BC.ann` |
+| `aklavi_25702` | Aklavik Highway, NWT Canada — Arctic tundra (ABoVE) | skip (redundant w/ `barrow`) | `Release31/aklavi_25702_01/aklavi_25702_17070_003_170622_L090HH_01_BC.ann` |
+| `anaktW_16405` | Anaktuvuk Burn Scar West, AK — Arctic tundra burn scar | skip (redundant w/ `barrow`) | `Release24/anaktW_16405_01/anaktW_16405_17069_005_170621_L090HH_01_BC.ann` |
+| `atchaf_19809` | Atchafalaya Delta, LA (different track, same site) | skip (dup of `atchaf_06309`) | `Release30/atchaf_19809_02/atchaf_19809_21023_000_210327_L090HH_02_BU.ann` |
+| `wterre_16300` | West Terrebonne Basin, LA — coastal wetland/bayou | skip (dup LA wetland bucket) | `Release31/wterre_16300_02/wterre_16300_21026_000_210405_L090HH_02_BU.ann` |
+| `NISARP_20706` | Yucatan Lake, LA — lake/wetland | skip (dup LA wetland bucket) | `Release31/NISARP_20706_01/NISARP_20706_19040_011_190622_L090HH_01_BU.ann` |
+| `alamos_35915` | Los Alamos, NM — montane forest/sagebrush | skip (dup of `dorado`, smaller) | `Release20/alamos_35915_04/alamos_35915_20005_003_200212_L090HH_04_BU.ann` |
 
 Selected the 6 **use** sites — 6 distinct terrain types (alpine, agricultural, Arctic coastal tundra, subtropical wetland, montane forest, urban/mountain valley), zero overlap with each other or with BERMS/`monda`. The other 8 were dropped only because a stronger pick already covers the same terrain bucket, not for any data-quality reason — all 14 are equally valid stack-SLC quad-pol data. Full writeup in `docs/slc_sources.md`.
 
@@ -384,17 +319,50 @@ Verified before trusting it in a real run:
 
 Not yet trained or evaluated against the Step 1 polarimetric metrics -- next real GPU run should sweep `--wishart-weight` (doc suggests starting ~0.05-0.1) and compare H/A/coherence errors and PSNR against the Week 4.1 MSE-only baseline.
 
+### Real-GPU crash chain and fixes (2026-11-04)
+
+First real run, `--wishart-weight 0.1` on the remote Quadro RTX 8000 (TF 2.16.2/Keras 3), hit three distinct bugs before training ran stably -- all in `wishart_distance_tf`/`repr_to_cov_tf`, none in the MSE-only path:
+
+1. **XLA has no GPU kernel for complex64 `MatrixInverse`.** Crashed immediately (`InvalidArgumentError: ... MatrixInverse ... T=DT_COMPLEX64`) because Keras 3's `model.compile()` defaults to `jit_compile="auto"`, which traces the loss into an XLA cluster, and `tf.linalg.inv(complex64)` has no `XLA_GPU_JIT` kernel. Fix: replaced it with a closed-form 3x3 adjugate/determinant inverse (`_inv3x3`, `pol_nbdnet.py`) -- plain elementwise complex arithmetic, which XLA does support. Verified locally (TF 2.12): matches `tf.linalg.inv` to float32 precision (~1.8e-4 abs diff), matches numpy `wishart_distance` to ~2.7e-7 relative error, and compiles/runs clean under `jit_compile=True`.
+
+2. **`db_norm`/coherence overflow -> `inf` loss (batch 59).** With bug 1 fixed, the next run reached `Batch 59: Invalid loss, terminating training` (`loss: inf`). Cause: `output_image` (`model.py`) has `activation=None`, so an early/untrained net's raw output is unconstrained -- `db_norm` can drift outside its valid `[0,1]` range and `10**(db/10)` overflows float32 to `inf` within a few units of `db_norm > 10`; coherence channels similarly aren't bounded to `|gamma|<=1`. `repr_to_cov_tf` was decoding both unclamped. Fix: clamp `db_norm` to `[0,1]` and coherence magnitude to `<=1` (phase preserved) inside `repr_to_cov_tf` -- matches the range `cov_to_repr` already enforces on encode, so real/valid data (targets, already-trained predictions) is unaffected (verified 0.0 diff vs the numpy `repr_to_cov` reference on valid-range inputs).
+
+3. **Still `nan` at batch 1825, later but not gone.** With bugs 1-2 fixed, the run survived the full first epoch (635s, 15136 steps) instead of dying at batch 59 -- but still hit `Batch 1825: Invalid loss, terminating training` (`loss: nan`). The representation-level clamps bound the *decoded covariance*, but nothing was bounding gradient size, and the Wishart term's gradient gets steep near ill-conditioned matrices -- over ~1800 steps that's enough to walk the raw network weights into a bad region. Fix: extended the existing `clipnorm=1.0` safety net (previously gated to `--mixed-precision` only, added for an unrelated fp16 NaN in Week 3) to also apply whenever `--wishart-weight > 0`.
+
+Not yet confirmed whether fix 3 fully stabilizes training end-to-end (pending next real-GPU run) -- if `nan` recurs, next step is dropping to a smaller `--wishart-weight` (e.g. 0.01) before ramping up, per the roadmap doc's own recommendation, rather than adding more loss-level machinery.
+
+### Fix 3 result: much more stable, still eventually diverges (2026-11-05)
+
+Re-ran the same command (`--wishart-weight 0.1`, 20 epochs) with the `clipnorm` fix. Result: 9 full clean epochs before failure (vs. dying at batch 1825 of epoch 1 before this fix) -- `clipnorm` clearly helps, just doesn't fully solve it at this weight:
+
+| Epoch | loss | val_loss | lr |
+|---|---|---|---|
+| 1 | 0.1203 | 0.0291 | 0.0010 |
+| 2 | 0.0233 | 0.0459 | 0.0010 |
+| 3 | 0.0183 | 0.0299 | 0.0010 |
+| 4 | 0.0158 | 0.0482 | 0.0010 |
+| 5 | 0.0123 | 0.0129 | 0.0005 |
+| 6 | 0.0136 | 0.0163 | 0.0005 |
+| 7 | 0.0115 | 0.0276 | 0.0005 |
+| 8 | 0.0126 | **0.0114** | 0.0005 |
+| 9 | 0.0181 | 0.0255 | 0.0005 |
+| 10 | `nan` (batch 797) | `inf` | 0.0005 |
+
+Best val_loss (0.0114) was at epoch 8, right before the run started trending worse (9: 0.0181, loss already creeping up) then collapsed. `ModelCheckpoint(save_best_only=True)` + `EarlyStopping(restore_best_weights=True)` mean `nbdnet_model.keras` holds the epoch-8 weights, not garbage -- usable for evaluation now, independent of whether a longer run at this weight is stable.
+
+Not yet done: running `evaluate_nbdnet.py` on this checkpoint to see whether the Wishart term's polarimetric metrics (H/A/coherence errors from Step 1's suite) actually improved over the Week 4.1 MSE-only baseline -- that's the real payoff question, separate from training stability. Also not yet tried: a lower `--wishart-weight` (0.01-0.05) for a full stable 20-epoch run, per the roadmap doc's own recommendation -- 0.1 is evidently still too hot for long-run stability even with `clipnorm`.
+
 ---
 
 # Open items (current, across all weeks)
 
-1. ~~**Normalization domain-shift risk.**~~ **Resolved (2026-10-15, Week 2).** Switched from a single train-scene-fit global dB range to per-scene percentile normalization. Not re-verified in isolation whether this specifically fixed the #2628/#3628 blob artifacts from Week 1 — the scale-up run changed multiple things at once (normalization + 126x more data), so the artifact's exact cause is still not isolated. Worth a follow-up: re-run eval on a held-out Howland tile specifically to confirm.
+1. **Normalization domain-shift risk.** **Resolved (2026-10-15, Week 2).** Switched from a single train-scene-fit global dB range to per-scene percentile normalization. Not re-verified in isolation whether this specifically fixed the #2628/#3628 blob artifacts from Week 1 — the scale-up run changed multiple things at once (normalization + 126x more data), so the artifact's exact cause is still not isolated. Worth a follow-up: re-run eval on a held-out Howland tile specifically to confirm.
 
-2. ~~**No full-scene stitching, so no seam-blur check yet.**~~ **Resolved (2026-10-25, Week 3).** Seam scores ~1.0–1.02 across L=1,2,4,8 on a 1024×1024 `monda` crop — no detectable grid-line artifact at any noise level.
+2. **No full-scene stitching, so no seam-blur check yet.** **Resolved (2026-10-25, Week 3).** Seam scores ~1.0–1.02 across L=1,2,4,8 on a 1024×1024 `monda` crop — no detectable grid-line artifact at any noise level.
 
-3. ~~**No classical-filter baseline.**~~ **Resolved (2026-10-15, Week 2).** Boxcar and Lee filter baselines added. Finding: NBDNet beats both at L=1, roughly ties boxcar at L=2, but loses to both on raw PSNR at L=4 and L=8 — though it still wins on SSIM/CC at every L.
+3. **No classical-filter baseline.** **Resolved (2026-10-15, Week 2).** Boxcar and Lee filter baselines added. Finding: NBDNet beats both at L=1, roughly ties boxcar at L=2, but loses to both on raw PSNR at L=4 and L=8 — though it still wins on SSIM/CC at every L.
 
-4. ~~**Mixed-precision (fp16) training is broken on the remote GPU.**~~ **Resolved (2026-10-25, Week 3).** Root cause was several backbone `Conv2D` layers missing `BatchNormalization`/float32 pinning, letting fp16 activations grow unbounded. Ran 17 clean epochs, no NaN/inf, final val_loss 0.00237. Speed gain is marginal on this GPU (~5%), so fp16 is now usable but not a clear win — fp32 remains the default in `train_nbdnet.py`/CLAUDE.md pending a decision on whether to switch.
+4. **Mixed-precision (fp16) training is broken on the remote GPU.** **Resolved (2026-10-25, Week 3).** Root cause was several backbone `Conv2D` layers missing `BatchNormalization`/float32 pinning, letting fp16 activations grow unbounded. Ran 17 clean epochs, no NaN/inf, final val_loss 0.00237. Speed gain is marginal on this GPU (~5%), so fp16 is now usable but not a clear win — fp32 remains the default in `train_nbdnet.py`/CLAUDE.md pending a decision on whether to switch.
 
 5. **The L=4/L=8 classical-filter-catchup result deserves a decision, not just a note.** NBDNet is only the clear best choice at severe noise (L≤2). Options worth considering: (a) report this honestly as the real operating envelope of the model, (b) train a second model variant seeing higher L more often to see if that shifts the crossover point, or (c) look into a hybrid — classical filter at high L, NBDNet at low L — chosen by estimated look count at inference time.
 
