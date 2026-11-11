@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from . import model as _model  # noqa: F401 -- registers custom layers
-from .pol_nbdnet import repr_to_cov
+from .pol_nbdnet import enable_gpu_memory_growth, repr_to_cov
 from .visualize import pauli_rgb
+
+enable_gpu_memory_growth()  # must run before any TF op touches the GPU -- see docstring
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"

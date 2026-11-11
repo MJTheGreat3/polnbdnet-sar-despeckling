@@ -16,6 +16,23 @@ DB_MAX = 10.0
 _PAIRS = ((0, 1), (0, 2), (1, 2))
 
 
+def enable_gpu_memory_growth():
+    """Call once, before any TF op runs (module import time, not inside main()
+    -- TF locks this in as soon as a GPU is touched). Without this, TF grabs
+    nearly all currently-free VRAM in one shot at process start; on a GPU
+    shared with another process (e.g. an Ollama server), that snapshot varies
+    run to run with whatever the other process happens to be using at that
+    instant, and a run can fail outright if little was free right then (hit on
+    the real GPU box: TF saw as little as 7.77GiB free vs. 47GB on other runs,
+    purely due to timing). Growth mode allocates incrementally as needed
+    instead, so this job and the other process can actually share the card."""
+    for gpu in tf.config.list_physical_devices("GPU"):
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError:
+            pass  # GPUs already initialized elsewhere in the process; too late to change
+
+
 def cov_to_repr(C, db_min=DB_MIN, db_max=DB_MAX, eps=1e-12):
     """3x3 covariance -> 9 channels: 3 normalized-dB diag powers +
     6 real/imag parts of the complex coherences g_ij = C_ij / sqrt(C_ii C_jj).

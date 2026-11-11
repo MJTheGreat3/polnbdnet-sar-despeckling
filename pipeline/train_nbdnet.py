@@ -24,7 +24,9 @@ import keras
 import tensorflow as tf
 
 from .model import build_nbdnet
-from .pol_nbdnet import repr_to_cov_tf, wishart_distance_tf
+from .pol_nbdnet import enable_gpu_memory_growth, repr_to_cov_tf, wishart_distance_tf
+
+enable_gpu_memory_growth()  # must run before any TF op touches the GPU -- see docstring
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"

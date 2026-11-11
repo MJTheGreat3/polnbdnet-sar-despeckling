@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from . import model as _model  # noqa: F401 -- registers custom layers
-from .evaluate_nbdnet import span_db
+from .evaluate_nbdnet import span_db  # also calls enable_gpu_memory_growth() on import
 from .pol_nbdnet import cov_to_repr, simulate_polsar_speckle
 from .prepare_training_data import build_scene_clean_ref
 from .visualize import pauli_rgb

@@ -10,6 +10,7 @@ pipeline's Wishart-noise route, and does effectiveness hold up as L
 """
 import argparse
 import datetime
+import gc
 import json
 import os
 
@@ -20,9 +21,11 @@ from scipy.ndimage import uniform_filter
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 from . import model as _model  # noqa: F401 -- registers custom layers before load_model
-from .pol_nbdnet import repr_to_cov
+from .pol_nbdnet import enable_gpu_memory_growth, repr_to_cov
 from .polarimetric_eval import evaluate_candidate
 from .visualize import pauli_rgb
+
+enable_gpu_memory_growth()  # must run before any TF op touches the GPU -- see docstring
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"
@@ -209,6 +212,16 @@ def main():
             "noisy": repr_to_cov(noisy[mid], db_min=db_min, db_max=db_max),
             "denoised": repr_to_cov(denoised[mid], db_min=db_min, db_max=db_max),
         }
+
+        # ~2.2GB per complex128 (n_tiles,64,64,3,3) array, 5 of them (noisy/boxcar/lee/
+        # denoised/clean _cov) alive at once by this point -- same OOM risk class
+        # stitch_scene.py's --full flag already warns about for full-scene arrays. Drop
+        # them explicitly (and force the allocator to actually release, not just mark
+        # free) before the next L iteration's d/noisy/clean/denoised get loaded, instead
+        # of relying on refcounting to free them only once the names get reassigned.
+        del noisy_cov, boxcar_cov, lee_cov, denoised_cov, clean_cov
+        del noisy, clean, denoised, d
+        gc.collect()
 
     with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
         json.dump(results, f, indent=2)

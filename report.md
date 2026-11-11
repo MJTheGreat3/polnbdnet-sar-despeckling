@@ -395,6 +395,14 @@ Root cause: `model.save()` serializes the compiled loss along with the model. Pl
 
 Fix: `evaluate_nbdnet.py`, `make_before_after.py`, and `stitch_scene.py` all only run inference (`model.predict`), never need the compiled loss/optimizer state -- changed all three `keras.models.load_model(...)` calls to pass `compile=False`. Verified the failure mode and the fix locally (TF 2.12/Keras 2, a different Keras major version than the GPU box's TF 2.16.2/Keras 3, but the same underlying "can't deserialize a non-top-level loss closure" mechanism): saving a toy model compiled with an equivalent closure loss and loading it back reproduces a load error without `compile=False`, and loads + predicts cleanly with it.
 
+### GPU is shared with another process -- VRAM availability varies run to run
+
+After the `compile=False` fix, `evaluate_nbdnet.py` got past loading but then crashed with a TF `BFC allocator` out-of-memory dump (`Limit: 7.77GiB ... available size: 0B`). `nvidia-smi` on the box showed why: an unrelated `ollama`/`llama-server` process sharing the same Quadro RTX 8000, holding a few GB of VRAM that fluctuates with whatever it's serving. Across every run so far, TF's own startup log line (`Created device ... with X MB memory`) shows wildly different numbers purely from this: 15442MB, 17018MB, 17484MB, 47372MB, and this time only 7.77GB -- not a bug in our code, just TF grabbing "however much happened to be free" at the moment each process starts.
+
+Root cause: by default TF reserves nearly all currently-free VRAM in one allocation at startup (`gpu_device.cc`'s "Created device ... with X MB memory" line is that snapshot). On a GPU shared with another live process, that snapshot is pure timing luck -- if the other process is mid-request when ours starts, there may be almost nothing left, and the run fails immediately regardless of how much VRAM the job itself actually needs.
+
+Fix: added `enable_gpu_memory_growth()` (`pol_nbdnet.py`) -- calls `tf.config.experimental.set_memory_growth(gpu, True)` for every visible GPU, so TF allocates incrementally as needed instead of grabbing a big upfront chunk. Called at import time (must run before any op touches the GPU, so it's at module level, not inside `main()`) in all four GPU-touching scripts (`train_nbdnet.py`, `evaluate_nbdnet.py`, `make_before_after.py`, `stitch_scene.py`). Verified locally it's a safe no-op on a machine with no GPU (list is empty, loop does nothing) and tolerates being called twice (wrapped in `try/except RuntimeError`, for scripts like `stitch_scene.py` that import `evaluate_nbdnet` and therefore trigger it a second time). Doesn't guarantee a run never fails if the other process is using genuinely all the VRAM, but removes the "failed anyway despite plenty being free a few seconds later" timing-based failures that were otherwise indistinguishable from a real bug.
+
 ---
 
 # Open items (current, across all weeks)
