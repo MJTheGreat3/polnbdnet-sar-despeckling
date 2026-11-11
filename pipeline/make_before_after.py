@@ -24,7 +24,9 @@ def main():
     test_scenes = meta["scenes"]["test"]
     db_min, db_max = meta["per_scene_norm"][test_scenes[0]]
 
-    model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
+    # compile=False: inference only, and a model trained with --wishart-weight > 0
+    # can't deserialize compiled (see evaluate_nbdnet.py's load_model comment).
+    model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"), compile=False)
 
     d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
     noisy, clean = d["inputs"], d["targets"]

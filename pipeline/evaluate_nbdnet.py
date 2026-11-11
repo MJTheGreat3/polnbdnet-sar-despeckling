@@ -128,7 +128,11 @@ def main():
                                    "per-tile scene tracking would be needed for more than one")
     db_min, db_max = meta["per_scene_norm"][test_scenes[0]]
 
-    model = keras.models.load_model(args.model)
+    # compile=False: this script only calls model.predict(), never needs the compiled
+    # loss/optimizer -- and a model trained with --wishart-weight > 0 can't deserialize
+    # compiled anyway (make_loss()'s returned closure isn't an importable top-level
+    # function, so keras.saving can't resolve 'loss_fn' by name on load).
+    model = keras.models.load_model(args.model, compile=False)
 
     results = {}
     pol_results = {}

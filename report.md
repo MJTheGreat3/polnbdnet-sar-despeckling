@@ -352,6 +352,49 @@ Best val_loss (0.0114) was at epoch 8, right before the run started trending wor
 
 Not yet done: running `evaluate_nbdnet.py` on this checkpoint to see whether the Wishart term's polarimetric metrics (H/A/coherence errors from Step 1's suite) actually improved over the Week 4.1 MSE-only baseline -- that's the real payoff question, separate from training stability. Also not yet tried: a lower `--wishart-weight` (0.01-0.05) for a full stable 20-epoch run, per the roadmap doc's own recommendation -- 0.1 is evidently still too hot for long-run stability even with `clipnorm`.
 
+### Explained: the recurring "casting complex64 to float32" warning
+
+Every Wishart-loss run has logged `WARNING:tensorflow:You are casting an input of type complex64 to an incompatible dtype float32. This will discard the imaginary part and may not be what you intended.` a handful of times at the start of each epoch (2x, then 8x after the clamping fix added more ops) -- left unexplained until now.
+
+Traced locally: it's TensorFlow's autodiff backward pass through `repr_to_cov_tf`'s complex-number construction (`pol_nbdnet.py`), which builds the complex64 covariance matrix out of real float32 inputs via 3x `tf.complex(...)` (one per off-diagonal coherence pair) + 1x `tf.cast(..., complex64)` (the diagonal powers) -- 4 ops. Every time a gradient flows back through those to reach the real-valued `y_pred`, TF logs this warning once per op (hence 4, or more with retracing for different batch shapes).
+
+Confirmed benign: a plain forward call to `repr_to_cov_tf` (no `GradientTape`) produces zero warnings; wrapping the identical call in a tape and taking a gradient immediately produces 4 warnings, and the resulting gradient is still correct (`float32`, finite, matches the non-gradient-path numbers already verified in §4.2's checks). This is TF being generically cautious about "backprop through a complex intermediate back to a real input" -- which is exactly the intended math here (real network output -> complex covariance -> real scalar loss), not an actual bug. Only fires when `--wishart-weight > 0`; unrelated to the `nan` divergence above (that's gradient magnitude, this is just logging). No fix needed.
+
+### Lower weight (0.05) trains stably end-to-end (2026-11-05)
+
+Re-ran with `--wishart-weight 0.05` instead of `0.1` (same clipnorm/clamping fixes in place) -- no crash, no `nan`, full run to completion:
+
+| Epoch | loss | val_loss | lr |
+|---|---|---|---|
+| 1 | 0.1365 | 0.0236 | 0.0010 |
+| 2 | 0.0147 | 0.0204 | 0.0010 |
+| 3 | 0.0140 | 0.0235 | 0.0010 |
+| 4 | 0.0151 | **0.0124** | 0.0010 |
+| 5 | 0.0173 | 0.0328 | 0.0010 |
+| 6 | 0.0157 | 0.0257 | 0.0010 |
+| 7 | 0.0151 | 0.0317 | 0.0005 |
+| 8 | 0.0143 | 0.0185 | 0.0005 |
+| 9 | 0.0147 | 0.0186 | 0.0005 |
+| 10 | 0.0149 | 0.0193 | 0.0005 |
+
+Stopped at epoch 10 by `EarlyStopping` (patience=6) -- best val_loss (0.0124) was epoch 4, then 6 epochs without improvement, exhausting patience. This is the callback working as designed, not a crash: `restore_best_weights=True` + `ModelCheckpoint(save_best_only=True)` mean `nbdnet_model.keras` holds the epoch-4 weights. Also the first run to exercise the new per-run archiving (added this week) -- confirmed working: `archived this run to pipeline/results/runs/20261105_121943_w0.05/`.
+
+Not yet done: `evaluate_nbdnet.py` on this checkpoint -- same open question as the `0.1` run above (does the Wishart term actually move the polarimetric metrics), now with a run that didn't diverge.
+
+### Another bug, caught trying to evaluate: Wishart-trained models can't `load_model()`
+
+Running `evaluate_nbdnet.py` against the `w0.05` checkpoint above crashed on load, before computing a single metric:
+
+```
+TypeError: Could not locate function 'loss_fn'. Make sure custom classes and functions
+are decorated with `@keras.saving.register_keras_serializable()`. ...
+Full object config: {'module': 'builtins', 'class_name': 'function', 'config': 'loss_fn', ...}
+```
+
+Root cause: `model.save()` serializes the compiled loss along with the model. Plain MSE (`loss="mse"`, every prior run) is a string Keras resolves trivially. Once `--wishart-weight > 0`, `train_nbdnet.py` compiles with `make_loss(args.wishart_weight)` -- a closure returned by a factory function, not an importable top-level symbol -- so `keras.saving` can't resolve `'loss_fn'` by name on load. Every `--wishart-weight > 0` checkpoint has been affected since Step 3 was wired in; just never hit before because nothing had evaluated one until now.
+
+Fix: `evaluate_nbdnet.py`, `make_before_after.py`, and `stitch_scene.py` all only run inference (`model.predict`), never need the compiled loss/optimizer state -- changed all three `keras.models.load_model(...)` calls to pass `compile=False`. Verified the failure mode and the fix locally (TF 2.12/Keras 2, a different Keras major version than the GPU box's TF 2.16.2/Keras 3, but the same underlying "can't deserialize a non-top-level loss closure" mechanism): saving a toy model compiled with an equivalent closure loss and loading it back reproduces a load error without `compile=False`, and loads + predicts cleanly with it.
+
 ---
 
 # Open items (current, across all weeks)

@@ -159,7 +159,9 @@ def main():
     clean_repr = cov_to_repr(C_ref, db_min=db_min, db_max=db_max).astype("float32")
     noisy_repr = cov_to_repr(C_noisy, db_min=db_min, db_max=db_max).astype("float32")
 
-    model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"))
+    # compile=False: inference only, and a model trained with --wishart-weight > 0
+    # can't deserialize compiled (see evaluate_nbdnet.py's load_model comment).
+    model = keras.models.load_model(os.path.join(RESULTS_DIR, "nbdnet_model.keras"), compile=False)
 
     print(f"stitched inference (tile={TILE_SIZE}, stride={STRIDE}, border={BORDER}px trimmed per tile)...")
     denoised_repr = stitch_predict(model, noisy_repr)
