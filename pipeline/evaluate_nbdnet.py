@@ -144,7 +144,11 @@ def main():
         d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
         noisy, clean = d["inputs"], d["targets"]
 
-        denoised = model.predict(noisy, batch_size=64, verbose=0)
+        # batch_size=16, not 64 -- this box's GPU is shared with other jobs (report.md:
+        # "GPU is shared with another process"), and a smaller batch cuts this call's
+        # peak activation memory, improving the odds of fitting in whatever VRAM is
+        # actually free at the moment instead of needing a big single allocation.
+        denoised = model.predict(noisy, batch_size=16, verbose=0)
 
         noisy_cov = repr_to_cov(noisy, db_min=db_min, db_max=db_max)
         boxcar_cov = boxcar_filter_cov(noisy_cov)
