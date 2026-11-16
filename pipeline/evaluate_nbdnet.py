@@ -150,13 +150,37 @@ def main():
         # actually free at the moment instead of needing a big single allocation.
         denoised = model.predict(noisy, batch_size=16, verbose=0)
 
+        # Build + free each method's ~2.2GB (n_tiles,64,64,3,3) complex128 cov array
+        # one at a time instead of holding all 5 (noisy/boxcar/lee/denoised/clean,
+        # ~11GB total) simultaneously -- that peak was enough to trip systemd-oomd's
+        # memory-pressure kill on the shared GPU box (report.md: "Root cause of 'it
+        # killed my whole tmux session'"), which kills the whole tmux cgroup, not
+        # just this process. clean_cov is the one exception kept alive throughout,
+        # since every method's polarimetric eval below needs it as the reference.
+        clean_cov = repr_to_cov(clean, db_min=db_min, db_max=db_max)
+
         noisy_cov = repr_to_cov(noisy, db_min=db_min, db_max=db_max)
+        noisy_span = np.diagonal(noisy_cov, axis1=-2, axis2=-1).real.sum(axis=-1)
         boxcar_cov = boxcar_filter_cov(noisy_cov)
         lee_cov = lee_filter_cov(noisy_cov, L=L)
-        denoised_cov = repr_to_cov(denoised, db_min=db_min, db_max=db_max)
-        clean_cov = repr_to_cov(clean, db_min=db_min, db_max=db_max)
+        pol_noisy = evaluate_candidate(noisy_cov, clean_cov, noisy_span=noisy_span, L=L)
+        del noisy_cov
+        gc.collect()
+
         boxcar_db = cov_span_db(boxcar_cov)
+        pol_boxcar = evaluate_candidate(boxcar_cov, clean_cov, noisy_span=noisy_span, L=L)
+        del boxcar_cov
+        gc.collect()
+
         lee_db = cov_span_db(lee_cov)
+        pol_lee = evaluate_candidate(lee_cov, clean_cov, noisy_span=noisy_span, L=L)
+        del lee_cov
+        gc.collect()
+
+        denoised_cov = repr_to_cov(denoised, db_min=db_min, db_max=db_max)
+        pol_denoised = evaluate_candidate(denoised_cov, clean_cov, noisy_span=noisy_span, L=L)
+        del denoised_cov, clean_cov
+        gc.collect()
 
         clean_db = span_db(clean, db_min, db_max)
         noisy_db = span_db(noisy, db_min, db_max)
@@ -191,13 +215,15 @@ def main():
               f"SSIM noisy {r['noisy_vs_clean']['ssim']:.3f} -> NBDNet {r['denoised_vs_clean']['ssim']:.3f}")
 
         # Polarimetric evaluation suite (report.md roadmap Step 1): does the
-        # model preserve the cross-channel structure, not just span PSNR?
-        noisy_span = np.diagonal(noisy_cov, axis1=-2, axis2=-1).real.sum(axis=-1)
+        # model preserve the cross-channel structure, not just span PSNR? --
+        # computed above, per-method, right alongside each cov array before it's
+        # freed (not recomputed here, since noisy_cov/boxcar_cov/lee_cov/
+        # denoised_cov/clean_cov are already gone by this point).
         pol_results[f"L={L}"] = {
-            "noisy_vs_clean": evaluate_candidate(noisy_cov, clean_cov, noisy_span=noisy_span, L=L),
-            "boxcar_vs_clean": evaluate_candidate(boxcar_cov, clean_cov, noisy_span=noisy_span, L=L),
-            "lee_vs_clean": evaluate_candidate(lee_cov, clean_cov, noisy_span=noisy_span, L=L),
-            "denoised_vs_clean": evaluate_candidate(denoised_cov, clean_cov, noisy_span=noisy_span, L=L),
+            "noisy_vs_clean": pol_noisy,
+            "boxcar_vs_clean": pol_boxcar,
+            "lee_vs_clean": pol_lee,
+            "denoised_vs_clean": pol_denoised,
         }
         pr = pol_results[f"L={L}"]
         print(f"  polarimetric: PSD-valid noisy={pr['noisy_vs_clean']['psd_valid_fraction']:.3f} "
@@ -217,13 +243,9 @@ def main():
             "denoised": repr_to_cov(denoised[mid], db_min=db_min, db_max=db_max),
         }
 
-        # ~2.2GB per complex128 (n_tiles,64,64,3,3) array, 5 of them (noisy/boxcar/lee/
-        # denoised/clean _cov) alive at once by this point -- same OOM risk class
-        # stitch_scene.py's --full flag already warns about for full-scene arrays. Drop
-        # them explicitly (and force the allocator to actually release, not just mark
-        # free) before the next L iteration's d/noisy/clean/denoised get loaded, instead
-        # of relying on refcounting to free them only once the names get reassigned.
-        del noisy_cov, boxcar_cov, lee_cov, denoised_cov, clean_cov
+        # all 5 cov arrays already freed one at a time above as each was finished
+        # with (the peak-memory fix) -- just the repr/raw arrays left to drop
+        # before the next L iteration's d/noisy/clean/denoised get loaded.
         del noisy, clean, denoised, d
         gc.collect()
 

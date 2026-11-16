@@ -409,6 +409,29 @@ Re-ran `evaluate_nbdnet.py` after the `enable_gpu_memory_growth()` fix above. St
 
 This is a genuinely shared, multi-tenant box, not just "one ollama instance sometimes using a few GB" as first assumed -- `enable_gpu_memory_growth()` still helps (stops us from ever grabbing more than we need), but it can't manufacture VRAM that other users' processes are actively holding. The only other code-level lever is shrinking our own job's peak footprint so it's more likely to fit in whatever happens to be free. Fix: dropped `evaluate_nbdnet.py`'s `model.predict(noisy, batch_size=64, ...)` to `batch_size=16` -- doesn't change results (batch size is purely a compute-batching detail, not part of the model), just lowers peak activation memory per inference call. Doesn't guarantee success if other jobs are using literally all the VRAM at that instant; the practical remaining mitigation is checking `nvidia-smi` before launching a run on this box.
 
+### Root cause of "it killed my whole tmux session" -- confirmed via journalctl (2026-11-16)
+
+Several runs on the real GPU box have ended with the entire tmux server gone, not just the training/eval process -- previously unexplained. Re-ran `evaluate_nbdnet.py` (fresh log, `47360 MB` GPU memory available this time -- not a VRAM problem) and it died silently again, process gone, zero output past TF's own startup lines. `journalctl --since "-15 min"` showed the actual cause:
+
+```
+systemd[...]: tmux-spawn-<uuid>.scope: systemd-oomd killed 3 process(es) in this unit.
+systemd[...]: tmux-spawn-<uuid>.scope: Failed with result 'oom-kill'.
+```
+
+`systemd-oomd` operates on cgroups, not individual processes: on this box, the tmux server and everything launched inside that tmux session (including our python job) share one cgroup scope (`tmux-spawn-*.scope`). When `systemd-oomd` detects memory pressure (PSI) crossing its threshold *anywhere in that cgroup*, it kills the **whole scope** -- tmux server included -- not just the offending process. `free -h` immediately after showed 42GB free / 56GB "available": this was a transient pressure *spike* (tripping oomd's PSI heuristic), not sustained exhaustion, consistent with this being a shared box where other users' concurrent jobs (confirmed via `who`/`last -x`: multiple other accounts with many simultaneous tmux panes) push momentary pressure high enough to trigger it.
+
+Fix (operational, not a code change -- this is a box/session-management issue, not a bug in our scripts): launch the job in its own `systemd-run --user --scope` instead of directly in the tmux shell, so it gets a separate cgroup from the tmux server. If `systemd-oomd` fires again, it kills only that scope -- the job -- and the tmux session survives:
+```
+systemd-run --user --scope -p MemoryMax=30G -- python -u -m pipeline.evaluate_nbdnet 2>&1 | tee eval_log.txt
+```
+(`-u` also forces unbuffered stdout, so the log reflects real progress instead of sitting in python's buffer until exit -- a separate confusion hit while debugging this, where a still-running job looked identical to a dead one in the log.)
+
+### Also cut the actual memory spike, not just isolated it (2026-11-16)
+
+Isolating the job's cgroup (above) stops a kill from taking tmux down with it, but doesn't stop the kill itself. The real spike: `evaluate_nbdnet.py`'s per-`L` loop built all 5 methods' covariance arrays (`noisy_cov`, `boxcar_cov`, `lee_cov`, `denoised_cov`, `clean_cov`, each ~2.2GB complex128 `(n_tiles,64,64,3,3)` for this test shard) and held all of them alive simultaneously (~11GB) for the whole metrics block -- the existing `del`+`gc.collect()` only ran *between* L-iterations, not during this in-loop peak, so it never actually helped here.
+
+Fix: restructured the loop to build each method's cov array, compute everything that needs it (span-dB metrics input, polarimetric eval), then free it before moving to the next method -- `clean_cov` is the only one kept alive the whole time, since every method's polarimetric comparison needs it as the reference. Peak simultaneous cov arrays drops from 5 (~11GB) to at most 2 (~4.4GB). Output/results are identical (same values, same JSON), this only changes *when* each array is freed, not what's computed. Moved the polarimetric `evaluate_candidate(...)` calls to run immediately after each cov array is built (previously they ran in a second pass near the end of the loop, after other methods' covs were already stale candidates for freeing) -- `pol_results` now just references the dicts computed during that first pass instead of recomputing from arrays that no longer exist by that point.
+
 ---
 
 # Open items (current, across all weeks)
