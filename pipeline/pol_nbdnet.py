@@ -54,8 +54,15 @@ def cov_to_repr(C, db_min=DB_MIN, db_max=DB_MAX, eps=1e-12):
     return np.concatenate([db_norm, coh], axis=-1)  # (..., 9)
 
 
-def repr_to_cov(repr_arr, db_min=DB_MIN, db_max=DB_MAX):
-    """Inverse of cov_to_repr: 9 channels -> 3x3 Hermitian covariance."""
+def repr_to_cov(repr_arr, db_min=DB_MIN, db_max=DB_MAX, dtype=np.complex128):
+    """Inverse of cov_to_repr: 9 channels -> 3x3 Hermitian covariance.
+
+    dtype defaults to complex128 (unchanged behavior for every existing
+    caller -- training data prep, checklist.py's Hermitian/PSD checks, etc.
+    all assume this). evaluate_nbdnet.py passes complex64 explicitly for its
+    big (n_tiles,64,64,3,3) arrays, since halving their footprint there is
+    worth the precision loss for evaluation metrics (report.md: the
+    systemd-oomd peak-memory fixes)."""
     repr_arr = np.asarray(repr_arr)
     db_norm = repr_arr[..., :3]
     coh = repr_arr[..., 3:]
@@ -64,7 +71,7 @@ def repr_to_cov(repr_arr, db_min=DB_MIN, db_max=DB_MAX):
     diag = 10.0 ** (db / 10.0)
 
     shape = repr_arr.shape[:-1]
-    C = np.zeros(shape + (3, 3), dtype=np.complex128)
+    C = np.zeros(shape + (3, 3), dtype=dtype)
     for idx in range(3):
         C[..., idx, idx] = diag[..., idx]
 

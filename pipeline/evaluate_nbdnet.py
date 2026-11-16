@@ -157,9 +157,12 @@ def main():
         # killed my whole tmux session'"), which kills the whole tmux cgroup, not
         # just this process. clean_cov is the one exception kept alive throughout,
         # since every method's polarimetric eval below needs it as the reference.
-        clean_cov = repr_to_cov(clean, db_min=db_min, db_max=db_max)
+        # complex64, not complex128 -- halves each ~2.2GB array to ~1.1GB. Precision
+        # loss is fine for evaluation metrics (not used for training); only these big
+        # (n_tiles,64,64,3,3) arrays matter for memory, not the small example_tiles ones.
+        clean_cov = repr_to_cov(clean, db_min=db_min, db_max=db_max, dtype=np.complex64)
 
-        noisy_cov = repr_to_cov(noisy, db_min=db_min, db_max=db_max)
+        noisy_cov = repr_to_cov(noisy, db_min=db_min, db_max=db_max, dtype=np.complex64)
         noisy_span = np.diagonal(noisy_cov, axis1=-2, axis2=-1).real.sum(axis=-1)
         boxcar_cov = boxcar_filter_cov(noisy_cov)
         lee_cov = lee_filter_cov(noisy_cov, L=L)
@@ -177,7 +180,7 @@ def main():
         del lee_cov
         gc.collect()
 
-        denoised_cov = repr_to_cov(denoised, db_min=db_min, db_max=db_max)
+        denoised_cov = repr_to_cov(denoised, db_min=db_min, db_max=db_max, dtype=np.complex64)
         pol_denoised = evaluate_candidate(denoised_cov, clean_cov, noisy_span=noisy_span, L=L)
         del denoised_cov, clean_cov
         gc.collect()
