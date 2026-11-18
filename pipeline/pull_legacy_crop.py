@@ -1,0 +1,143 @@
+"""Pull a crop from a remote NATIVE legacy-format UAVSAR SLC source (flat
+little-endian complex64 binaries served directly over HTTP, not a NISAR
+HDF5 file) -- the 6 terrain-diversity sites picked in report.md Week 3
+(S3.3) ship this way: a small .ann file plus 4x huge .slc files, one per
+polarization, no HDF5 conversion step needed (unlike nisar_to_legacy.py,
+which exists for the NISAR-format source).
+
+Pulls via HTTP Range requests (one GET per output row, per polarization),
+so only the requested row/col window is downloaded -- a full flight line's
+.slc file can be tens of GB, never download it whole for a 4096x4096 crop.
+Writes a local .ann + 4x .slc crop in the exact layout uavsar_io.load_scene
+already expects (same convention nisar_to_legacy.py produces), so the rest
+of the pipeline needs no changes to consume it.
+
+Usage:
+    python -m pipeline.pull_legacy_crop \
+        --ann-url https://downloaduav2.jpl.nasa.gov/Release32/rockmt_14107_01/rockmt_14107_20005_009_200212_L090HH_01_BU.ann \
+        --out-dir pipeline/data/raw/rockmt_r0_c0 \
+        --scene-id rockmt_r0_c0 \
+        --row-start 0 --row-size 4096 --col-start 0 --col-size 4096
+"""
+import argparse
+import os
+import re
+
+import numpy as np
+import requests
+
+from .ann_parser import find_slc_segments, parse_ann
+
+BYTES_PER_PIXEL = 8  # complex64: 2x float32
+POLS = ("HH", "HV", "VH", "VV")
+
+
+def _download_text(url):
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+def _pol_url(ann_url, pol):
+    """Swap the polarization token in the .ann URL/filename to get the
+    matching .slc URL for a different polarization, e.g. ..._L090HH_01_BC.ann
+    -> ..._L090HV_01_BC.slc. All 4 pols share the same path/suffix, differing
+    only in this one token (verified against report.md's S3.3 source table)."""
+    base = re.sub(r"\.ann$", "", ann_url)
+    if f"L090{ann_url_pol(ann_url)}" not in base:
+        raise ValueError(f"could not find a polarization token in {ann_url} to swap")
+    swapped = base.replace(f"L090{ann_url_pol(ann_url)}", f"L090{pol}")
+    return swapped + ".slc"
+
+
+def ann_url_pol(ann_url):
+    m = re.search(r"L090(HH|HV|VH|VV)", ann_url)
+    if not m:
+        raise ValueError(f"could not find L090<pol> token in {ann_url}")
+    return m.group(1)
+
+
+def _range_get(url, offset, length):
+    headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+    r = requests.get(url, headers=headers, timeout=60)
+    if r.status_code != 206:
+        raise RuntimeError(f"expected 206 Partial Content from {url}, got {r.status_code} "
+                            f"-- server may not support Range requests")
+    return r.content
+
+
+def pull_crop_rows(slc_url, cols_total, row_start, row_size, col_start, col_size):
+    """One HTTP Range GET per output row -- row_size requests total for this
+    polarization. Fine for a handful of thousand rows; download the whole
+    .slc locally first (wget) and read it with uavsar_io instead if you need
+    many crops from the same flight line (same tradeoff as batch_pull_crops.py
+    vs. nisar_to_legacy.py for the NISAR-format route)."""
+    out = np.empty((row_size, col_size), dtype="<c8")
+    row_nbytes = cols_total * BYTES_PER_PIXEL
+    col_offset_bytes = col_start * BYTES_PER_PIXEL
+    row_len_bytes = col_size * BYTES_PER_PIXEL
+    for i in range(row_size):
+        row = row_start + i
+        offset = row * row_nbytes + col_offset_bytes
+        chunk = _range_get(slc_url, offset, row_len_bytes)
+        out[i] = np.frombuffer(chunk, dtype="<c8")
+    return out
+
+
+def pull_crop(ann_url, out_dir, scene_id, row_start, row_size, col_start, col_size):
+    os.makedirs(out_dir, exist_ok=True)
+
+    ann_text = _download_text(ann_url)
+    local_ann_src = os.path.join(out_dir, "_source.ann")
+    with open(local_ann_src, "w") as f:
+        f.write(ann_text)
+    ann = parse_ann(local_ann_src)
+    os.remove(local_ann_src)
+
+    segments = find_slc_segments(ann)
+    if not segments:
+        raise ValueError(f"could not find slc rows/columns keys in {ann_url}")
+    rows_total, cols_total, _ = segments[0]
+    row_end = min(row_start + row_size, rows_total)
+    col_end = min(col_start + col_size, cols_total)
+    actual_rows = row_end - row_start
+    actual_cols = col_end - col_start
+    print(f"scene is {rows_total}x{cols_total}; cropping to "
+          f"rows [{row_start}:{row_end}) x cols [{col_start}:{col_end}) = {actual_rows}x{actual_cols}")
+
+    for pol in POLS:
+        slc_url = _pol_url(ann_url, pol)
+        print(f"  pulling {pol} from {slc_url} ({actual_rows} range requests)...")
+        crop = pull_crop_rows(slc_url, cols_total, row_start, actual_rows, col_start, actual_cols)
+        out_path = os.path.join(out_dir, f"{scene_id}_{pol}_01.slc")
+        crop.tofile(out_path)
+        print(f"    wrote {out_path} ({crop.nbytes / 1e6:.1f} MB)")
+
+    ann_path = os.path.join(out_dir, f"{scene_id}.ann")
+    with open(ann_path, "w") as f:
+        f.write(f"; Cropped from remote legacy-format UAVSAR source: {ann_url}\n")
+        f.write(f"; Original scene shape: {rows_total} x {cols_total}\n")
+        f.write(f"; Crop origin (row, col): ({row_start}, {col_start})\n")
+        f.write(f"slc_1_1x1 rows (pixels) = {actual_rows}\n")
+        f.write(f"slc_1_1x1 columns (pixels) = {actual_cols}\n")
+        f.write("slc_no_data (real) = 0.0\n")
+    print(f"  wrote {ann_path}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--ann-url", required=True, help="the HH .ann URL (report.md S3.3 table), "
+                                                      "e.g. .../rockmt_14107_20005_009_200212_L090HH_01_BU.ann")
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--scene-id", required=True)
+    p.add_argument("--row-start", type=int, default=0)
+    p.add_argument("--row-size", type=int, default=4096)
+    p.add_argument("--col-start", type=int, default=0)
+    p.add_argument("--col-size", type=int, default=4096)
+    args = p.parse_args()
+    pull_crop(args.ann_url, args.out_dir, args.scene_id,
+               args.row_start, args.row_size, args.col_start, args.col_size)
+
+
+if __name__ == "__main__":
+    main()

@@ -144,11 +144,10 @@ def main():
 
     with open(os.path.join(DATA_DIR, "meta.json")) as f:
         meta = json.load(f)
+    # one or more held-out test scenes (report.md Open item #6: test used to be
+    # a single scene -- now supports several, each scored independently, so
+    # metrics stop being a single-sample estimate of generalization).
     test_scenes = meta["scenes"]["test"]
-    if len(test_scenes) != 1:
-        raise NotImplementedError("evaluate_nbdnet assumes a single test scene; "
-                                   "per-tile scene tracking would be needed for more than one")
-    db_min, db_max = meta["per_scene_norm"][test_scenes[0]]
 
     # compile=False: this script only calls model.predict(), never needs the compiled
     # loss/optimizer -- and a model trained with --wishart-weight > 0 can't deserialize
@@ -158,9 +157,14 @@ def main():
 
     results = {}
     pol_results = {}
-    example_tiles = {}
-    for L in TEST_L_VALUES:
-        d = np.load(os.path.join(DATA_DIR, "test", f"{test_scenes[0]}_L{L}.npz"))
+    for scene_id in test_scenes:
+      db_min, db_max = meta["per_scene_norm"][scene_id]
+      results[scene_id] = {}
+      pol_results[scene_id] = {}
+      example_tiles = {}
+      print(f"=== test scene: {scene_id} ===")
+      for L in TEST_L_VALUES:
+        d = np.load(os.path.join(DATA_DIR, "test", f"{scene_id}_L{L}.npz"))
         noisy, clean = d["inputs"], d["targets"]
 
         # batch_size=16, not 64 -- this box's GPU is shared with other jobs (report.md:
@@ -219,18 +223,19 @@ def main():
             ms = [compute_metrics(clean_db[i], other_db[i], data_range) for i in range(n)]
             return {k: avg(ms, k) for k in ("psnr", "ssim", "rmse", "cc")}
 
-        results[f"L={L}"] = {
+        results[scene_id][f"L={L}"] = {
             "n_tiles": n,
             "noisy_vs_clean": metrics_vs_clean(noisy_db),
             "boxcar_vs_clean": metrics_vs_clean(boxcar_db),
             "lee_vs_clean": metrics_vs_clean(lee_db),
             "denoised_vs_clean": metrics_vs_clean(denoised_db),
         }
-        improvement = results[f"L={L}"]["denoised_vs_clean"]["psnr"] - results[f"L={L}"]["noisy_vs_clean"]["psnr"]
-        results[f"L={L}"]["psnr_improvement_db"] = improvement
+        improvement = (results[scene_id][f"L={L}"]["denoised_vs_clean"]["psnr"]
+                       - results[scene_id][f"L={L}"]["noisy_vs_clean"]["psnr"])
+        results[scene_id][f"L={L}"]["psnr_improvement_db"] = improvement
 
-        r = results[f"L={L}"]
-        print(f"L={L}: noisy {r['noisy_vs_clean']['psnr']:.2f}dB  "
+        r = results[scene_id][f"L={L}"]
+        print(f"[{scene_id}] L={L}: noisy {r['noisy_vs_clean']['psnr']:.2f}dB  "
               f"boxcar {r['boxcar_vs_clean']['psnr']:.2f}dB  "
               f"lee {r['lee_vs_clean']['psnr']:.2f}dB  "
               f"NBDNet {r['denoised_vs_clean']['psnr']:.2f}dB  (+{improvement:.2f}dB vs noisy)  "
@@ -241,13 +246,13 @@ def main():
         # computed above, per-method, right alongside each cov array before it's
         # freed (not recomputed here, since noisy_cov/boxcar_cov/lee_cov/
         # denoised_cov/clean_cov are already gone by this point).
-        pol_results[f"L={L}"] = {
+        pol_results[scene_id][f"L={L}"] = {
             "noisy_vs_clean": pol_noisy,
             "boxcar_vs_clean": pol_boxcar,
             "lee_vs_clean": pol_lee,
             "denoised_vs_clean": pol_denoised,
         }
-        pr = pol_results[f"L={L}"]
+        pr = pol_results[scene_id][f"L={L}"]
         print(f"  polarimetric: PSD-valid noisy={pr['noisy_vs_clean']['psd_valid_fraction']:.3f} "
               f"boxcar={pr['boxcar_vs_clean']['psd_valid_fraction']:.3f} "
               f"lee={pr['lee_vs_clean']['psd_valid_fraction']:.3f} "
@@ -277,12 +282,19 @@ def main():
         # box, systemd-oomd), losing all 3 L's worth of results since the only
         # json.dump was after the full loop. These get overwritten by the
         # complete versions below on a clean finish; on a crash, whatever's here
-        # is the last-known-good partial result instead of nothing.
+        # is the last-known-good partial result instead of nothing. Dumping the
+        # whole (now multi-scene) results/pol_results dict each time is cheap
+        # relative to the eval itself, and keeps every already-finished scene's
+        # numbers on disk too, not just the one currently in progress.
         with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
             json.dump(results, f, indent=2)
         with open(os.path.join(RESULTS_DIR, "polarimetric_evaluation.json"), "w") as f:
             json.dump(pol_results, f, indent=2)
-        print(f"  (progress saved: {len(results)}/{len(TEST_L_VALUES)} L values done)")
+        print(f"  (progress saved: scene {scene_id}, {len(results[scene_id])}/{len(TEST_L_VALUES)} L values done)")
+
+      eval_fig_path = os.path.join(RESULTS_DIR, f"evaluation_examples_{scene_id}.png")
+      make_figure(example_tiles, eval_fig_path)
+      print(f"wrote {eval_fig_path}")
 
     with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -292,17 +304,14 @@ def main():
         json.dump(pol_results, f, indent=2)
     print(f"wrote {RESULTS_DIR}/polarimetric_evaluation.json")
 
-    eval_fig_path = os.path.join(RESULTS_DIR, "evaluation_examples.png")
-    make_figure(example_tiles, eval_fig_path)
-    print(f"wrote {eval_fig_path}")
-
     # archived copies, keyed by run_id (see RUNS_DIR comment) -- canonical RESULTS_DIR
-    # files above still get overwritten every run as before.
+    # files above still get overwritten every run as before. Per-scene example
+    # figures were already written above (evaluation_examples_<scene_id>.png);
+    # nothing further to archive for those beyond what's already on disk.
     with open(os.path.join(run_dir, "evaluation.json"), "w") as f:
         json.dump(results, f, indent=2)
     with open(os.path.join(run_dir, "polarimetric_evaluation.json"), "w") as f:
         json.dump(pol_results, f, indent=2)
-    make_figure(example_tiles, os.path.join(run_dir, "evaluation_examples.png"))
     print(f"archived this evaluation to {run_dir}/")
 
 

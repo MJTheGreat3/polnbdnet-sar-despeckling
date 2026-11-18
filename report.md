@@ -486,7 +486,7 @@ Not a clean ablation yet, though -- two confounds, either of which alone could e
 
 5. **The L=4/L=8 classical-filter-catchup result deserves a decision, not just a note.** NBDNet is only the clear best choice at severe noise (L≤2). Options worth considering: (a) report this honestly as the real operating envelope of the model, (b) train a second model variant seeing higher L more often to see if that shifts the crossover point, or (c) look into a hybrid — classical filter at high L, NBDNet at low L — chosen by estimated look count at inference time.
 
-6. **Val and test are each a single scene.** Even after scaling train to 126 scenes, val (`bermsr`) and test (`monda`) are still one flight-line crop apiece — unchanged since Week 1. Metrics are solid evidence the model generalizes across *different* sites (train/val/test are 3 distinct real locations), but not evidence it's robust across the *range* of scenes a given split might contain, since each split is only one sample of that range. Next: pull 2-3 more held-out scenes per split (same data source already supports this) and report variance across them, not just a single point estimate. **In progress (Week 3, §3.3)** — 6 new terrain-diverse sites selected; plan is to add held-out test scenes from these alongside the train expansion.
+6. **Val and test are each a single scene.** Even after scaling train to 126 scenes, val (`bermsr`) and test (`monda`) are still one flight-line crop apiece — unchanged since Week 1. Metrics are solid evidence the model generalizes across *different* sites (train/val/test are 3 distinct real locations), but not evidence it's robust across the *range* of scenes a given split might contain, since each split is only one sample of that range. **In progress (2026-11-18).** `evaluate_nbdnet.py` no longer assumes a single test scene — it loops over `meta["scenes"]["test"]`, keys `evaluation.json`/`polarimetric_evaluation.json` by scene id, and writes one example figure per scene (`evaluation_examples_<scene_id>.png`). `pull_terrain_sites.sh` (new) pulls one crop each from 4 of the 6 terrain-diverse sites selected in §3.3 into train (`rockmt`/`cvalle`/`atchaf`/`dorado`), and one crop each from the other 2 into a 2nd val scene (`barrow_val1`) and a 2nd test scene (`stlake_test1`) — wired into `SCENES` in `prepare_training_data.py`. Not yet actually pulled/run on the real box as of this writing — these are the 6 sites' native legacy-format flat-binary SLC source, so pulled via a new `pull_legacy_crop.py` (HTTP Range reads per row) rather than `nisar_to_legacy.py`/`batch_pull_crops.py`, which are NISAR-HDF5-only.
 
 ---
 
@@ -503,11 +503,13 @@ pipeline/stitch_scene.py                         full-scene stitched inference +
 pipeline/make_before_after.py                    before/after example figure generation
 pipeline/batch_pull_crops.py                     cuts multiple crops from one downloaded flight line
 pipeline/nisar_to_legacy.py                      NISAR HDF5 -> legacy .ann/.slc converter
+pipeline/pull_legacy_crop.py                     crop puller for native legacy-format (non-HDF5) remote SLC sources
 pull_200gb_dataset.sh                            scale-up data pull (5 flight lines, ~205GB)
+pull_terrain_sites.sh                            terrain-diversity data pull (S3.3 sites -> train + 2nd val/test scene)
 pipeline/results/nbdnet_model.keras              trained model (1.42M params, 200GB-scale weights)
 pipeline/results/train_history.json              full loss curves (20 epochs, scale-up run)
-pipeline/results/evaluation.json                 full metrics table incl. boxcar/Lee
-pipeline/results/evaluation_examples.png         visual comparison, clean/noisy/denoised x L
+pipeline/results/evaluation.json                 full metrics table incl. boxcar/Lee, keyed by test scene id
+pipeline/results/evaluation_examples_<scene>.png visual comparison, clean/noisy/denoised x L, one per test scene
 pipeline/results/before_after_examples.png       5 varied test tiles, before/after at L=1
 docs/stitch_monda_L{1,2,4,8}.{json,png}          full-scene stitching check, seam score + figure per L
 ```

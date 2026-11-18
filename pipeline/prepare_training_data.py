@@ -1,9 +1,12 @@
 """Build train/val/test tiles for the NBDNet Wishart-noise effectiveness
 experiment.
 
-Train/val scenes get per-tile random look-count L in {1,2,4} (matching
-the paper's own training setup and guide Step 9.4's suggestion to vary L
-so the network generalizes across noise levels). The held-out test scene
+Train/val scenes get per-tile random look-count L in {1,2,4,8}. Originally
+{1,2,4} (matching the paper's own setup), but report.md's Week 4 eval
+showed NBDNet losing to classical boxcar/Lee filters on raw PSNR at
+L=4 and L=8 -- plausibly because train never saw L=8 at all. Added 8
+here to test whether exposure to that noise level during training shifts
+the crossover point (report.md Open items #5b). The held-out test scene
 gets a SEPARATE tile set per fixed L in {1,2,4,8}, same tile origins
 across all L, so recovery quality can be compared per noise severity
 (guide Step 13 / paper Table 1 style evaluation).
@@ -42,14 +45,18 @@ REF_WINDOW = 15
 TILE_SIZE = 64
 STRIDE = 64
 VALID_FRAC_THRESH = 0.95
-TRAIN_L_CHOICES = (1, 2, 4)
+TRAIN_L_CHOICES = (1, 2, 4, 8)
 TEST_L_VALUES = (1, 2, 4, 8)
 
 # batch_pull_crops.py names each crop "<prefix>_r<row>_c<col>" -- any
 # scene id starting with one of these prefixes is auto-added to train, so a
 # 100+ scene pull (see pull_200gb_dataset.sh) doesn't need a hand-typed list.
 # Keep val/test scenes' flight lines out of this list (leakage, guide Step 11).
-AUTO_TRAIN_PREFIXES = ["bermsR_r", "bermsA1_r", "bermsA2_r", "bermsB1_r", "bermsB2_r"]
+# rockmt_r/cvalle_r/atchaf_r/dorado_r (added by pull_terrain_sites.sh, report.md
+# S3.3) are the 4 terrain-diversity sites going to train; barrow/stlake from
+# that same pull go to val/test instead -- added explicitly below, not here.
+AUTO_TRAIN_PREFIXES = ["bermsR_r", "bermsA1_r", "bermsA2_r", "bermsB1_r", "bermsB2_r",
+                        "rockmt_r", "cvalle_r", "atchaf_r", "dorado_r"]
 
 
 def discover_scenes(prefixes, raw_dir=RAW_DIR):
@@ -65,7 +72,18 @@ def discover_scenes(prefixes, raw_dir=RAW_DIR):
 # Add more scene ids here (one list entry per crop you pulled with
 # nisar_to_legacy.py) to grow the training set. Keep val/test scenes
 # distinct flight lines never touched during train.
-SCENES = {"train": ["howlnd"] + discover_scenes(AUTO_TRAIN_PREFIXES), "val": ["bermsr"], "test": ["monda"]}
+#
+# "barrow_val1"/"stlake_test1" (pull_terrain_sites.sh, report.md S3.3) are
+# the 2nd val/test scenes -- added so val/test metrics stop being a single-
+# scene estimate (Open item #6). They're no-ops here if not yet pulled:
+# process_scene() just raises a clear FileNotFoundError for a missing dir,
+# so pull them first, or drop these two lines to fall back to the old
+# single-scene val/test while they're not available yet.
+SCENES = {
+    "train": ["howlnd"] + discover_scenes(AUTO_TRAIN_PREFIXES),
+    "val": ["bermsr"] + (["barrow_val1"] if os.path.isdir(os.path.join(RAW_DIR, "barrow_val1")) else []),
+    "test": ["monda"] + (["stlake_test1"] if os.path.isdir(os.path.join(RAW_DIR, "stlake_test1")) else []),
+}
 
 
 def enumerate_tile_origins(valid_mask, tile_size=TILE_SIZE, stride=STRIDE, thresh=VALID_FRAC_THRESH):
