@@ -9,6 +9,7 @@ pipeline's Wishart-noise route, and does effectiveness hold up as L
 (noise severity) changes.
 """
 import argparse
+import ctypes
 import datetime
 import gc
 import json
@@ -26,6 +27,24 @@ from .polarimetric_eval import evaluate_candidate
 from .visualize import pauli_rgb
 
 enable_gpu_memory_growth()  # must run before any TF op touches the GPU -- see docstring
+
+
+def _malloc_trim():
+    """gc.collect() frees python objects, but glibc's allocator doesn't
+    necessarily hand that memory back to the OS -- it can sit in the
+    process's arenas for reuse, so RSS stays elevated even though nothing
+    is referencing it. Observed on the real GPU box: the per-L peak-memory
+    fixes (report.md) got 3/4 L values through cleanly, then still died on
+    the 4th from what looked like cumulative growth despite every array
+    being del'd + gc.collect()'d each iteration -- this is the textbook
+    cause. malloc_trim(0) explicitly asks glibc to release free arena pages
+    back to the OS. No-op (safe) on non-glibc platforms (e.g. this repo's
+    other dev target, macOS/Apple Silicon)."""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass  # not glibc (e.g. macOS) -- nothing to trim this way, skip
+
 
 DATA_DIR = "pipeline/data/experiment"
 RESULTS_DIR = "pipeline/results"
@@ -251,6 +270,19 @@ def main():
         # before the next L iteration's d/noisy/clean/denoised get loaded.
         del noisy, clean, denoised, d
         gc.collect()
+        _malloc_trim()
+
+        # write progress after every L, not just at the end -- observed a run die
+        # on the 4th of 4 L values after the first 3 completed cleanly (real GPU
+        # box, systemd-oomd), losing all 3 L's worth of results since the only
+        # json.dump was after the full loop. These get overwritten by the
+        # complete versions below on a clean finish; on a crash, whatever's here
+        # is the last-known-good partial result instead of nothing.
+        with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
+            json.dump(results, f, indent=2)
+        with open(os.path.join(RESULTS_DIR, "polarimetric_evaluation.json"), "w") as f:
+            json.dump(pol_results, f, indent=2)
+        print(f"  (progress saved: {len(results)}/{len(TEST_L_VALUES)} L values done)")
 
     with open(os.path.join(RESULTS_DIR, "evaluation.json"), "w") as f:
         json.dump(results, f, indent=2)

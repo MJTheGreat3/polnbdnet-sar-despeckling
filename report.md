@@ -440,6 +440,38 @@ Tried exempting the unit from `systemd-oomd`'s proactive pressure-based kill (`-
 
 Instead cut actual memory further: `repr_to_cov` (`pol_nbdnet.py`) hardcoded `complex128` (16 bytes/element) for its output covariance array regardless of caller. Added an optional `dtype` parameter (default unchanged -- every other caller, e.g. `prepare_training_data.py`, `checklist.py`'s Hermitian/PSD validation, keeps complex128 exactly as before) and pass `dtype=np.complex64` from `evaluate_nbdnet.py`'s three big-array call sites (`clean_cov`, `noisy_cov`, `denoised_cov`) -- halves each from ~2.2GB to ~1.1GB. Checked `boxcar_filter_cov`/`lee_filter_cov` (derived from `noisy_cov`): both use `np.empty_like(C)` and dtype-preserving arithmetic, so they inherit `complex64` automatically with no forced upcast back to complex128. Precision loss is acceptable here -- these arrays only feed evaluation metrics (PSNR/SSIM/polarimetric errors), never training. Combined with the earlier one-at-a-time restructuring, peak simultaneous cov-array memory is now roughly 2.2GB (down from the original ~11GB).
 
+### First real evaluation numbers (3 of 4 L values), and the next memory fix (2026-11-16)
+
+With the complex64 fix above (synced via `run.sh`'s `systemd-run --user --scope -p MemoryMax=30G` isolation), `evaluate_nbdnet.py` got through L=1, L=2, and L=4 cleanly -- first real post-GPU-fix numbers:
+
+| L | noisy PSNR | boxcar PSNR | lee PSNR | NBDNet PSNR | improvement vs noisy | SSIM noisy -> NBDNet | H_mae noisy -> NBDNet |
+|---|---|---|---|---|---|---|---|
+| 1 | 18.35dB | 32.28dB | 31.66dB | 24.22dB | +5.87dB | 0.116 -> 0.645 | 0.5689 -> 0.0940 |
+| 2 | 21.75dB | 35.50dB | 34.89dB | 25.83dB | +4.08dB | 0.206 -> 0.747 | 0.3216 -> 0.0789 |
+| 4 | 25.02dB | 38.10dB | 37.57dB | 27.07dB | +2.04dB | 0.327 -> 0.805 | 0.1688 -> 0.0684 |
+
+NBDNet clearly beats noisy on every metric and every L, and closes most of the H (entropy) gap -- but boxcar/lee classical baselines still beat NBDNet on raw span PSNR at every L (expected per report.md's existing boxcar-has-a-structural-home-field-advantage caveat, since boxcar is close to how `C_ref` itself was generated). Improvement margin vs noisy shrinks as L grows (makes sense -- less noise to remove to begin with). Ratio-image variance (`ratio_var`) is consistently *higher* than the expected `1/L` (e.g. L=4: 0.4823 vs expected 0.25) -- the despeckled output isn't yet hitting ideal speckle-only residual statistics, a real gap, not a measurement artifact.
+
+Died again on the 4th (L=8) value, however -- `./run.sh` showed a plain `Killed` (SIGKILL) after 3 clean iterations. Worse, **none of these numbers got saved to disk** -- `evaluation.json`/`polarimetric_evaluation.json` were only written once, after the full loop finished, so the crash lost all 3 completed L's worth of results, visible only in the terminal scrollback above. Fixed: now writes `evaluation.json`/`polarimetric_evaluation.json` after every single L iteration (not just at the end), so a later crash only loses the L's not yet reached, not everything.
+
+Also added a `_malloc_trim()` helper (`evaluate_nbdnet.py`, calls glibc's `malloc_trim(0)` via `ctypes`, no-op on non-glibc platforms like macOS) after each L iteration's `gc.collect()`. Suspected cause of dying on the 4th iteration despite every array being properly `del`'d + `gc.collect()`'d each time: `gc.collect()` only frees *python* references -- glibc's own allocator doesn't necessarily return that freed memory to the OS, so the process's RSS can stay elevated (and keep climbing slightly each iteration) even though nothing is logically still referenced. `malloc_trim(0)` explicitly asks glibc to hand free arena pages back, which should stop this slow creep across L iterations.
+
+### Does the Wishart loss actually help? Not yet -- worse on every metric (2026-11-16)
+
+**TL;DR:** Comparing the `--wishart-weight 0.05` checkpoint against the existing MSE-only baseline on the same test scene (§4.1), the Wishart-weighted model is worse on every metric at every look-count tested (L=1,2,4): PSNR down ~10dB (34.4→24.2dB at L=1), SSIM down 0.15-0.29 (0.93→0.65 at L=1), entropy error (H_mae) up ~2x, and HH-VV coherence error up 4-7x -- and that coherence error barely improves with L, staying stuck around 0.22 instead of the baseline's clean monotonic drop. So as currently trained, adding the Wishart loss term is hurting performance, not helping. That said, it's not a clean verdict on the loss term itself: this run stopped early via `EarlyStopping` (best val_loss at epoch 4 of ~10) and also used gradient clipping (`clipnorm=1.0`, added only for training stability) that the baseline never had -- either confound alone could explain the gap. The real next step is re-running with a comparable epoch budget (no premature early-stop) and/or a lower weight (e.g. 0.01) before concluding anything definitive about whether Wishart loss helps.
+
+Direct comparison against the Week 4.1 MSE-only baseline (§4.1 above, same test scene, same noisy/boxcar/lee columns -- confirms it's the same data/setup, a real apples-to-apples check) using the three L values obtained so far from the `--wishart-weight 0.05` checkpoint:
+
+| L | PSNR: MSE-only → Wishart(0.05) | SSIM: MSE-only → Wishart(0.05) | H_mae: MSE-only → Wishart(0.05) | HHVV-coh-mag_mae: MSE-only → Wishart(0.05) |
+|---|---|---|---|---|
+| 1 | 34.40dB → 24.22dB | 0.933 → 0.645 | 0.044 → 0.094 | 0.054 → 0.225 |
+| 2 | 35.50dB → 25.83dB | 0.947 → 0.747 | 0.035 → 0.079 | 0.042 → 0.221 |
+| 4 | 36.21dB → 27.07dB | 0.957 → 0.805 | 0.024 → 0.068 | 0.032 → 0.221 |
+
+The Wishart-weighted model is worse on every metric at every L -- ~10dB worse PSNR, 0.15-0.29 worse SSIM, ~2x worse H_mae, 4-7x worse HHVV-coh-mag_mae (which also barely improves with L, staying ~0.22 across L=1/2/4 instead of the baseline's clean monotonic drop). As currently wired/trained, the Wishart term is hurting, not helping.
+
+Not a clean ablation yet, though -- two confounds, either of which alone could explain this without implicating the Wishart term itself: (1) this run stopped early via `EarlyStopping` (best val_loss at epoch 4, patience ended it ~epoch 10) -- far fewer effective training steps than the baseline; (2) `clipnorm=1.0` was added to this run for stability (not present in the MSE-only baseline), which could itself slow/limit convergence independent of the Wishart term. Next step before concluding anything about the loss term itself: re-run with the same epoch budget as the baseline (not early-stopped this early) and/or try a smaller weight (e.g. 0.01), to isolate whether the gap is the Wishart term or just these training-recipe differences.
+
 ---
 
 # Open items (current, across all weeks)
