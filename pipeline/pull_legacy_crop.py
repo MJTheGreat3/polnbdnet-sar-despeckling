@@ -41,13 +41,19 @@ def _download_text(url):
 def _pol_url(ann_url, pol):
     """Swap the polarization token in the .ann URL/filename to get the
     matching .slc URL for a different polarization, e.g. ..._L090HH_01_BC.ann
-    -> ..._L090HV_01_BC.slc. All 4 pols share the same path/suffix, differing
-    only in this one token (verified against report.md's S3.3 source table)."""
+    -> ..._L090HV_01_BC_s1_1x1.slc. All 4 pols share the same path/suffix,
+    differing only in this one token -- but the .slc filename is NOT just
+    the .ann name with the extension swapped: it's '.ann' replaced by
+    '_s1_1x1.slc' (report.md S3.3: "the matching 4 .slc files sit next to
+    it with the same filename stem ... _s1_1x1.slc instead of .ann").
+    Confirmed via curl -I: the naive .ann-with-swapped-extension URL
+    302-redirects to the JPL homepage (no such file); adding _s1_1x1 before
+    .slc returns a real 200 with Accept-Ranges: bytes."""
     base = re.sub(r"\.ann$", "", ann_url)
     if f"L090{ann_url_pol(ann_url)}" not in base:
         raise ValueError(f"could not find a polarization token in {ann_url} to swap")
     swapped = base.replace(f"L090{ann_url_pol(ann_url)}", f"L090{pol}")
-    return swapped + ".slc"
+    return swapped + "_s1_1x1.slc"
 
 
 def ann_url_pol(ann_url):
