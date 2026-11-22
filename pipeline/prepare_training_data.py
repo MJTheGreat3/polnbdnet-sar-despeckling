@@ -114,15 +114,31 @@ def build_scene_clean_ref(scene_id):
 
 
 def build_tiles(C_ref, origins, db_min, db_max, rng, fixed_L=None, L_choices=None):
-    inputs, targets, Ls = [], [], []
-    for (r, c) in origins:
+    """Writes straight into preallocated float32 output arrays instead of
+    building up two Python lists of (64,64,9) float64 per-tile arrays
+    (cov_to_repr's natural output dtype) and only converting/concatenating
+    at the very end. A scene with ~3800+ tiles turned that end step into a
+    multi-GB burst -- np.stack() on ~3800 float64 arrays, immediately
+    followed by .astype('float32') while the stacked float64 version was
+    still alive -- on top of C_ref already being alive throughout this
+    whole loop. That burst, not this function's steady-state footprint, is
+    what was tripping systemd-oomd's pressure kill on the real box right
+    after a scene's validity check finished (report.md). Assigning each
+    tile's cov_to_repr result (float64) into a float32 slot downcasts it
+    immediately, per tile, instead of once for the whole scene at the end.
+    """
+    n = len(origins)
+    inputs = np.empty((n, TILE_SIZE, TILE_SIZE, 9), dtype=np.float32)
+    targets = np.empty((n, TILE_SIZE, TILE_SIZE, 9), dtype=np.float32)
+    Ls = np.empty(n, dtype=np.int8)
+    for idx, (r, c) in enumerate(origins):
         crop = C_ref[r:r + TILE_SIZE, c:c + TILE_SIZE]
         L = fixed_L if fixed_L is not None else int(rng.choice(L_choices))
         noisy = simulate_polsar_speckle(crop, L=L, rng=rng)
-        inputs.append(cov_to_repr(noisy, db_min=db_min, db_max=db_max))
-        targets.append(cov_to_repr(crop, db_min=db_min, db_max=db_max))
-        Ls.append(L)
-    return (np.stack(inputs).astype("float32"), np.stack(targets).astype("float32"), np.array(Ls, dtype="int8"))
+        inputs[idx] = cov_to_repr(noisy, db_min=db_min, db_max=db_max)
+        targets[idx] = cov_to_repr(crop, db_min=db_min, db_max=db_max)
+        Ls[idx] = L
+    return inputs, targets, Ls
 
 
 def _scene_done(split_dir, sid, split):
