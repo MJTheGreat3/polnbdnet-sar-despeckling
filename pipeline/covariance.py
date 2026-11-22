@@ -71,24 +71,60 @@ def build_covariance(hh, hv, vh, vv, window=5, mask=None, dtype=None):
     return multilook_covariance(kk, window=window, mask=mask)
 
 
-def is_hermitian(C, atol=1e-4):
-    return np.allclose(C, np.conj(np.swapaxes(C, -1, -2)), atol=atol, equal_nan=True)
+def is_hermitian(C, atol=1e-4, chunk_size=500_000):
+    """Chunked, not one np.allclose(C, conj(swapaxes(C))) over the whole
+    array -- that conj()+swapaxes() pair each materialize a full-size copy
+    of C on top of whatever's already alive in the caller, which at a
+    4096x4096 scene (~16.7M pixels) is a multi-GB burst allocation/free in
+    a few milliseconds. Fine on a quiet box; on this one (shared, other
+    tenants already keeping the box's memory pressure nonzero) that burst
+    was enough to trip systemd-oomd's per-cgroup pressure kill on
+    prepare_training_data.py (report.md). Chunking bounds the temp copy to
+    chunk_size regardless of scene size -- exact same result (every pixel
+    still compared, same tolerance), just not all at once. Early-exits on
+    the first non-Hermitian chunk, which also can't change the answer
+    (allclose needs ALL elements within tolerance)."""
+    C = np.asarray(C)
+    flat = C.reshape(-1, C.shape[-2], C.shape[-1])
+    n = flat.shape[0]
+    for start in range(0, n, chunk_size):
+        chunk = flat[start:start + chunk_size]
+        if not np.allclose(chunk, np.conj(np.swapaxes(chunk, -1, -2)), atol=atol, equal_nan=True):
+            return False
+    return True
 
 
-def check_covariance_validity(C, tol=1e-6):
-    """Step 4.5 / Step 13 checks: Hermitian, real+nonneg diagonal, PSD."""
+def check_covariance_validity(C, tol=1e-6, chunk_size=500_000):
+    """Step 4.5 / Step 13 checks: Hermitian, real+nonneg diagonal, PSD.
+
+    The eigenvalue check runs in chunks too, for the same reason as
+    is_hermitian above: flat[valid] (needed to drop NaN pixels before
+    eigvalsh, which NaNs would poison) is a boolean fancy-index, which
+    always copies -- at scene scale that's another multi-GB burst. Chunked,
+    this checks the exact same pixels and returns the exact same
+    min_eigenvalue/psd verdict, just without ever holding more than
+    chunk_size pixels' worth of temporaries at once.
+    """
     diag = np.diagonal(C, axis1=-2, axis2=-1)
     report = {
         "diag_real": bool(np.nanmax(np.abs(diag.imag)) < 1e-3) if diag.size else True,
         "diag_nonneg": bool(np.nanmin(diag.real) >= -tol) if diag.size else True,
-        "hermitian": is_hermitian(C),
+        "hermitian": is_hermitian(C, chunk_size=chunk_size),
     }
     flat = C.reshape(-1, C.shape[-2], C.shape[-1])
-    valid = ~np.any(np.isnan(flat), axis=(-1, -2))
-    if valid.any():
-        eigvals = np.linalg.eigvalsh(flat[valid])
-        report["min_eigenvalue"] = float(np.min(eigvals))
-        report["psd"] = bool(np.min(eigvals) >= -tol)
+    n = flat.shape[0]
+    min_eigenvalue = None
+    for start in range(0, n, chunk_size):
+        chunk = flat[start:start + chunk_size]
+        valid = ~np.any(np.isnan(chunk), axis=(-1, -2))
+        if not valid.any():
+            continue
+        eigvals = np.linalg.eigvalsh(chunk[valid])
+        chunk_min = float(np.min(eigvals))
+        min_eigenvalue = chunk_min if min_eigenvalue is None else min(min_eigenvalue, chunk_min)
+    if min_eigenvalue is not None:
+        report["min_eigenvalue"] = min_eigenvalue
+        report["psd"] = bool(min_eigenvalue >= -tol)
     else:
         report["min_eigenvalue"] = float("nan")
         report["psd"] = True
