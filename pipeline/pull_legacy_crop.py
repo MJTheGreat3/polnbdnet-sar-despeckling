@@ -5,9 +5,16 @@ HDF5 file) -- the 6 terrain-diversity sites picked in report.md Week 3
 polarization, no HDF5 conversion step needed (unlike nisar_to_legacy.py,
 which exists for the NISAR-format source).
 
-Pulls via HTTP Range requests (one GET per output row, per polarization),
-so only the requested row/col window is downloaded -- a full flight line's
-.slc file can be tens of GB, never download it whole for a 4096x4096 crop.
+Pulls via HTTP Range requests, chunked a few hundred rows at a time (one
+request per chunk, full row width -- the crop's columns are a strict
+sub-range of the full row, so rows aren't byte-contiguous across a
+column-cropped span; fetching full width and slicing in memory avoids
+needing one request per row). First version of this script did one
+request per OUTPUT row (4096 tiny sequential requests per polarization)
+and that reliably killed the connection (RemoteDisconnected / read
+timeout) partway through on the real remote box -- too chatty for
+whatever's on the other end (likely a connection/rate limit, not a
+Range-support issue: Range itself is confirmed working, see _pol_url).
 Writes a local .ann + 4x .slc crop in the exact layout uavsar_io.load_scene
 already expects (same convention nisar_to_legacy.py produces), so the rest
 of the pipeline needs no changes to consume it.
@@ -22,18 +29,36 @@ Usage:
 import argparse
 import os
 import re
+import time
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 from .ann_parser import find_slc_segments, parse_ann
 
 BYTES_PER_PIXEL = 8  # complex64: 2x float32
 POLS = ("HH", "HV", "VH", "VV")
+ROWS_PER_REQUEST = 256  # ~20MB/request at a typical ~10000-col scene width -- big
+                        # enough to keep request count sane (16 per pol for a
+                        # 4096-row crop, not 4096), small enough that one dropped
+                        # connection only costs one chunk's retry, not the whole crop.
 
 
-def _download_text(url):
-    r = requests.get(url, timeout=30)
+def _session():
+    s = requests.Session()
+    # connect AND read retries -- the read timeout seen on the real box happens
+    # mid-transfer, not just on connect, so both need covering.
+    retry = Retry(total=6, connect=6, read=6, backoff_factor=2,
+                  status_forcelist=[500, 502, 503, 504])
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    return s
+
+
+def _download_text(session, url):
+    r = session.get(url, timeout=30)
     r.raise_for_status()
     return r.text
 
@@ -63,37 +88,52 @@ def ann_url_pol(ann_url):
     return m.group(1)
 
 
-def _range_get(url, offset, length):
+def _range_get(session, url, offset, length, attempts=3):
     headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code != 206:
-        raise RuntimeError(f"expected 206 Partial Content from {url}, got {r.status_code} "
-                            f"-- server may not support Range requests")
-    return r.content
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            r = session.get(url, headers=headers, timeout=120)
+            if r.status_code != 206:
+                raise RuntimeError(f"expected 206 Partial Content from {url}, got {r.status_code} "
+                                    f"-- server may not support Range requests")
+            return r.content
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as exc:
+            last_exc = exc
+            wait = 2 ** attempt
+            print(f"    chunk failed ({exc.__class__.__name__}), retrying in {wait}s "
+                  f"(attempt {attempt + 1}/{attempts})...")
+            time.sleep(wait)
+    raise last_exc
 
 
-def pull_crop_rows(slc_url, cols_total, row_start, row_size, col_start, col_size):
-    """One HTTP Range GET per output row -- row_size requests total for this
-    polarization. Fine for a handful of thousand rows; download the whole
-    .slc locally first (wget) and read it with uavsar_io instead if you need
-    many crops from the same flight line (same tradeoff as batch_pull_crops.py
-    vs. nisar_to_legacy.py for the NISAR-format route)."""
+def pull_crop_rows(session, slc_url, cols_total, row_start, row_size, col_start, col_size):
+    """Fetch [row_start:row_start+row_size) x [col_start:col_start+col_size)
+    in chunks of ROWS_PER_REQUEST full-width rows -- each chunk is one Range
+    GET covering the chunk's full row width (unavoidable since the crop's
+    columns aren't a contiguous byte range across multiple rows), then
+    sliced down to the wanted columns in memory."""
     out = np.empty((row_size, col_size), dtype="<c8")
     row_nbytes = cols_total * BYTES_PER_PIXEL
-    col_offset_bytes = col_start * BYTES_PER_PIXEL
-    row_len_bytes = col_size * BYTES_PER_PIXEL
-    for i in range(row_size):
-        row = row_start + i
-        offset = row * row_nbytes + col_offset_bytes
-        chunk = _range_get(slc_url, offset, row_len_bytes)
-        out[i] = np.frombuffer(chunk, dtype="<c8")
+    n_chunks = -(-row_size // ROWS_PER_REQUEST)
+    for ci in range(n_chunks):
+        r0 = ci * ROWS_PER_REQUEST
+        r1 = min(r0 + ROWS_PER_REQUEST, row_size)
+        chunk_rows = r1 - r0
+        offset = (row_start + r0) * row_nbytes
+        length = chunk_rows * row_nbytes
+        print(f"    chunk {ci + 1}/{n_chunks} ({chunk_rows} rows, {length / 1e6:.1f} MB)...")
+        raw = _range_get(session, slc_url, offset, length)
+        full_width = np.frombuffer(raw, dtype="<c8").reshape(chunk_rows, cols_total)
+        out[r0:r1] = full_width[:, col_start:col_start + col_size]
     return out
 
 
 def pull_crop(ann_url, out_dir, scene_id, row_start, row_size, col_start, col_size):
     os.makedirs(out_dir, exist_ok=True)
+    session = _session()
 
-    ann_text = _download_text(ann_url)
+    ann_text = _download_text(session, ann_url)
     local_ann_src = os.path.join(out_dir, "_source.ann")
     with open(local_ann_src, "w") as f:
         f.write(ann_text)
@@ -113,8 +153,8 @@ def pull_crop(ann_url, out_dir, scene_id, row_start, row_size, col_start, col_si
 
     for pol in POLS:
         slc_url = _pol_url(ann_url, pol)
-        print(f"  pulling {pol} from {slc_url} ({actual_rows} range requests)...")
-        crop = pull_crop_rows(slc_url, cols_total, row_start, actual_rows, col_start, actual_cols)
+        print(f"  pulling {pol} from {slc_url}...")
+        crop = pull_crop_rows(session, slc_url, cols_total, row_start, actual_rows, col_start, actual_cols)
         out_path = os.path.join(out_dir, f"{scene_id}_{pol}_01.slc")
         crop.tofile(out_path)
         print(f"    wrote {out_path} ({crop.nbytes / 1e6:.1f} MB)")
