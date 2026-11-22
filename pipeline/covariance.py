@@ -19,7 +19,13 @@ def multilook_covariance(C_in, window=5, mask=None):
     C_in = np.asarray(C_in)
     if mask is None:
         mask = np.ones(C_in.shape[:2], dtype=bool)
-    weight = mask.astype(np.float64)
+    # float32, not float64 -- mask values are exactly 0.0/1.0 either way (no
+    # precision lost), but multiplying a complex64 C_in by a float64 weight
+    # silently upcasts the whole (H,W,3,3) result to complex128, doubling
+    # memory for no reason. Matters at 4096x4096: that's the difference
+    # between a ~1.2GB and ~2.4GB `weighted` array (report.md: real-box OOM
+    # investigation for prepare_training_data.py).
+    weight = mask.astype(np.float32)
 
     weighted = C_in * weight[..., None, None]
     C = np.zeros_like(weighted)
@@ -28,16 +34,25 @@ def multilook_covariance(C_in, window=5, mask=None):
             C[..., i, j] = uniform_filter(
                 weighted[..., i, j].real, size=window, mode="reflect"
             ) + 1j * uniform_filter(weighted[..., i, j].imag, size=window, mode="reflect")
+    del weighted
 
     valid_frac = uniform_filter(weight, size=window, mode="reflect")
     safe = np.where(valid_frac == 0, np.nan, valid_frac)
     with np.errstate(invalid="ignore"):
-        C = C / safe[..., None, None]
+        C /= safe[..., None, None]  # in-place: no second full-size array alongside the first
     return C, valid_frac
 
 
-def build_covariance(hh, hv, vh, vv, window=5, mask=None):
+def build_covariance(hh, hv, vh, vv, window=5, mask=None, dtype=None):
     """C = windowed average of k k^H, respecting a validity mask.
+
+    dtype defaults to preserving hh's own dtype (complex128 for raw SLC
+    read via uavsar_io, unchanged behavior for every existing caller).
+    Pass dtype=np.complex64 for a ~2x memory cut on the dense (H,W,3,3)
+    intermediates at the cost of complex64 precision -- fine whenever the
+    result ultimately gets cast to float32 anyway (prepare_training_data.py:
+    cov_to_repr's 9-channel output is float32, so complex128 precision in
+    this intermediate step is wasted upstream of that cast).
 
     Returns (C, valid_frac) where C has shape (H, W, 3, 3) complex and
     valid_frac is the fraction of the window that was valid data,
@@ -47,9 +62,12 @@ def build_covariance(hh, hv, vh, vv, window=5, mask=None):
     hv = np.asarray(hv)
     vh = np.asarray(vh)
     vv = np.asarray(vv)
+    if dtype is None:
+        dtype = hh.dtype
     hv_sym = symmetrize_hv(hv, vh)
-    k = np.stack([hh, np.sqrt(2) * hv_sym, vv], axis=-1)  # (H, W, 3)
+    k = np.stack([hh, np.sqrt(2) * hv_sym, vv], axis=-1).astype(dtype)  # (H, W, 3)
     kk = k[..., :, None] * np.conj(k[..., None, :])  # (H, W, 3, 3)
+    del k, hv_sym
     return multilook_covariance(kk, window=window, mask=mask)
 
 

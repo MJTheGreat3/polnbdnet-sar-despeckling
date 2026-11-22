@@ -99,8 +99,15 @@ def enumerate_tile_origins(valid_mask, tile_size=TILE_SIZE, stride=STRIDE, thres
 def build_scene_clean_ref(scene_id):
     scene = load_scene(os.path.join(RAW_DIR, scene_id))
     mask = build_valid_mask(scene["hh"], scene["hv"], scene["vh"], scene["vv"], nodata=0.0, edge_margin=4)
+    # complex64, not the raw SLC's complex128 -- halves the ~470 bytes/pixel
+    # dense (H,W,3,3) intermediates build_covariance materializes (~8GB ->
+    # ~4GB at 4096x4096). Free: build_tiles below casts everything to
+    # float32 for storage regardless, so complex128 precision here was
+    # already being thrown away downstream (report.md: real-box OOM
+    # investigation while adding the S3.3 terrain-diversity scenes).
     C_ref, keep = build_clean_reference(scene["hh"], scene["hv"], scene["vh"], scene["vv"],
-                                         mask=mask, window=REF_WINDOW, min_valid_frac=VALID_FRAC_THRESH)
+                                         mask=mask, window=REF_WINDOW, min_valid_frac=VALID_FRAC_THRESH,
+                                         dtype=np.complex64)
     report = check_covariance_validity(C_ref)
     valid_mask = mask & keep
     return C_ref, valid_mask, report

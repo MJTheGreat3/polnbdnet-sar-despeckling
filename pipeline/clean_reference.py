@@ -8,7 +8,7 @@ import numpy as np
 from .covariance import build_covariance, multilook_covariance
 
 
-def build_clean_reference(hh, hv, vh, vv, mask=None, window=15, min_valid_frac=0.9):
+def build_clean_reference(hh, hv, vh, vv, mask=None, window=15, min_valid_frac=0.9, dtype=None):
     """Large-window multilook average as a stand-in for speckle-free C.
 
     Caller is responsible for choosing spatially homogeneous patches
@@ -18,8 +18,12 @@ def build_clean_reference(hh, hv, vh, vv, mask=None, window=15, min_valid_frac=0
     8.3 "discard"); it's advisory, not baked into C_ref as NaN, since
     tiling (Step 10.3) tolerates up to ~10% low-confidence pixels per
     tile and a hard NaN would poison the whole tile instead.
+
+    dtype: see build_covariance -- pass np.complex64 to halve this scene's
+    dense (H,W,3,3) peak memory (prepare_training_data.py does, since its
+    output is float32 either way).
     """
-    C_ref, valid_frac = build_covariance(hh, hv, vh, vv, window=window, mask=mask)
+    C_ref, valid_frac = build_covariance(hh, hv, vh, vv, window=window, mask=mask, dtype=dtype)
     keep = valid_frac >= min_valid_frac
     return C_ref, keep
 
