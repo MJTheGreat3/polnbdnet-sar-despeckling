@@ -6,7 +6,17 @@ pol_nbdnet.py (cov_to_repr / repr_to_cov / simulate_polsar_speckle /
 check_validity / wishart_distance).
 """
 import numpy as np
-import tensorflow as tf
+
+# TF is imported lazily, inside each function that actually needs it
+# (enable_gpu_memory_growth / repr_to_cov_tf / _inv3x3 / wishart_distance_tf),
+# not at module level. cov_to_repr/repr_to_cov/simulate_polsar_speckle/
+# compute_db_norm_stats are pure numpy and prepare_training_data.py only
+# ever calls those -- a module-level `import tensorflow as tf` here used to
+# force TF's CUDA/cuDNN init (hundreds of MB-1GB+ host RAM, confirmed by the
+# "TensorFlow binary is optimized..." log line appearing even on a run that
+# never touches a GPU op) onto a script that's pure CPU numpy work, on a
+# memory-constrained shared box (report.md: prepare_training_data.py OOM
+# investigation while adding the S3.3 terrain-diversity scenes).
 
 # Placeholders -- overwrite from compute_db_norm_stats() on real training
 # data (valid pixels only) and reuse the same constants everywhere.
@@ -26,6 +36,7 @@ def enable_gpu_memory_growth():
     the real GPU box: TF saw as little as 7.77GiB free vs. 47GB on other runs,
     purely due to timing). Growth mode allocates incrementally as needed
     instead, so this job and the other process can actually share the card."""
+    import tensorflow as tf
     for gpu in tf.config.list_physical_devices("GPU"):
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -195,6 +206,7 @@ def repr_to_cov_tf(repr_tensor, db_min, db_max):
     loss (polarimetric roadmap Step 3). db_min/db_max broadcast against the
     (..., 3) diagonal channels -- pass per-tile values (not the module-level
     placeholders) since normalization is fit per scene, not globally."""
+    import tensorflow as tf
     repr_tensor = tf.cast(repr_tensor, tf.float32)
     db_min = tf.cast(db_min, tf.float32)
     db_max = tf.cast(db_max, tf.float32)
@@ -240,6 +252,7 @@ def _inv3x3(M):
     complex64 (MatrixInverse unsupported on XLA_GPU_JIT, hit when this is
     used inside a training loss -- Keras 3 jit-compiles by default) --
     plain arithmetic ops like this are XLA-compatible."""
+    import tensorflow as tf
     a, b, c = M[..., 0, 0], M[..., 0, 1], M[..., 0, 2]
     d, e, f = M[..., 1, 0], M[..., 1, 1], M[..., 1, 2]
     g, h, i = M[..., 2, 0], M[..., 2, 1], M[..., 2, 2]
@@ -256,6 +269,7 @@ def _inv3x3(M):
 def wishart_distance_tf(C1, C2, eps=1e-6):
     """TF-differentiable counterpart of wishart_distance, batched over any
     leading dims. Returns per-pixel distance (..., ), caller reduces."""
+    import tensorflow as tf
     n = C1.shape[-1]
     eye = tf.eye(n, dtype=tf.complex64) * eps
 
