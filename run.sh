@@ -12,13 +12,46 @@
 # ONLY safe for a module that's resumable (process_scene()'s _scene_done()
 # skips already-finished scenes, so a kill partway through prepare_
 # training_data just costs the one scene in progress, not the whole run).
-# Observed on the real box: the kill point moves around run to run (died
-# at a different step each time with no code change in between) -- a sign
-# of variable external contention (other tenants' jobs) on top of our own
-# allocations, not a single deterministic bug to keep chasing in our code.
 # Do NOT set RETRIES>1 for train_nbdnet.py -- it has no checkpoint-resume,
 # a retry would silently restart training from epoch 0, discarding
 # everything the killed run had done.
+#
+# Before each attempt (not just the first), waits for system-wide memory
+# pressure (/proc/pressure/memory, avg10) to actually be low, instead of a
+# blind fixed sleep. Confirmed via journalctl on the real box: a
+# systemd-oomd kill of a COMPLETELY UNRELATED unit
+# (snap.snapd-desktop-integration...) landed 16 seconds before our job got
+# killed in the same window, and during a later RETRIES=15/sleep-15s run,
+# systemd-oomd eventually killed the tmux-spawn scope itself too -- i.e.
+# this box was in a genuine system-wide memory-pressure episode (other
+# tenants), and retrying on a fixed short timer just adds another
+# memory-hungry process into that same bad window, worsening odds of
+# oomd escalating to a bigger unit (like tmux) instead of just ours.
+# Waiting for pressure to actually drop first is the fix, not a longer
+# fixed delay.
+PRESSURE_FILE=/proc/pressure/memory
+PRESSURE_THRESHOLD=2.0   # percent, avg10 -- comfortably above idle noise,
+                         # well below the levels seen during the bad window
+PRESSURE_MAX_WAIT=1800   # give up waiting after 30min and try anyway
+
+wait_for_low_pressure() {
+    [ -r "$PRESSURE_FILE" ] || return 0  # no PSI support -- nothing to gate on
+    local waited=0
+    while true; do
+        local avg10
+        avg10=$(awk -F'avg10=' '/^some/{split($2,a," "); print a[1]}' "$PRESSURE_FILE")
+        if awk -v v="$avg10" -v t="$PRESSURE_THRESHOLD" 'BEGIN{exit !(v < t)}'; then
+            return 0
+        fi
+        if [ "$waited" -ge "$PRESSURE_MAX_WAIT" ]; then
+            echo "memory pressure still elevated (avg10=${avg10}) after ${waited}s, proceeding anyway"
+            return 0
+        fi
+        echo "memory pressure elevated (avg10=${avg10} >= ${PRESSURE_THRESHOLD}), waiting 30s before (re)trying..."
+        sleep 30
+        waited=$((waited + 30))
+    done
+}
 #
 # Usage: ./run.sh <pipeline-module> [args...]
 #   e.g. ./run.sh evaluate_nbdnet
@@ -43,8 +76,9 @@ echo "running pipeline.${module} $* (isolated scope, log: ${log_file}, retries: 
 attempt=0
 while true; do
     attempt=$((attempt + 1))
+    wait_for_low_pressure
     echo "--- attempt ${attempt}/${retries} ---" | tee -a "${log_file}"
-    systemd-run --user --scope -p MemoryMax=30G -- \
+    systemd-run --user --scope -p MemoryMax=16G -- \
         python -u -m "pipeline.${module}" "$@" 2>&1 | tee -a "${log_file}"
     status="${PIPESTATUS[0]}"
     if [ "$status" -eq 0 ]; then
@@ -55,6 +89,5 @@ while true; do
         echo "pipeline.${module} failed after ${attempt} attempt(s), giving up" >&2
         exit 1
     fi
-    echo "pipeline.${module} died (exit ${status}), retrying in 15s..." | tee -a "${log_file}"
-    sleep 15
+    echo "pipeline.${module} died (exit ${status}), will wait for memory pressure to drop before retrying..." | tee -a "${log_file}"
 done
