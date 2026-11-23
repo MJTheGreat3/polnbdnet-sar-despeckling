@@ -86,6 +86,43 @@ def make_dataset(split, batch_size, shuffle, per_scene_norm):
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE), len(paths)
 
 
+def make_scene_dataset(path, batch_size, per_scene_norm):
+    """Single val scene, no shuffle/repeat -- used by PerSceneValLoss below
+    to break the combined val_loss apart per scene, since that average can
+    hide one bad-fit scene driving an overfitting spike (report.md:
+    2026-11-22 retrain investigation, bermsr+barrow_val1 pooled val_loss)."""
+    scene_id = os.path.splitext(os.path.basename(path))[0]
+    db_min, db_max = per_scene_norm[scene_id]
+    d = np.load(path)
+    inputs, targets = d["inputs"], d["targets"]
+    norm_cols = np.empty(targets.shape[:-1] + (2,), dtype=np.float32)
+    norm_cols[..., 0], norm_cols[..., 1] = db_min, db_max
+    targets_ext = np.concatenate([targets, norm_cols], axis=-1)
+    ds = tf.data.Dataset.from_tensor_slices((inputs, targets_ext)).batch(batch_size)
+    return ds, scene_id
+
+
+class PerSceneValLoss(keras.callbacks.Callback):
+    """Logs per-val-scene loss every epoch alongside the pooled val_loss
+    Keras already reports. Stored in train_history.json under
+    val_loss_by_scene (scene_id -> list, one entry per epoch)."""
+    def __init__(self, val_paths, batch_size, per_scene_norm):
+        super().__init__()
+        self.val_paths = val_paths
+        self.batch_size = batch_size
+        self.per_scene_norm = per_scene_norm
+        self.history = {}
+
+    def on_epoch_end(self, epoch, logs=None):
+        parts = []
+        for path in self.val_paths:
+            ds, scene_id = make_scene_dataset(path, self.batch_size, self.per_scene_norm)
+            loss = self.model.evaluate(ds, verbose=0)
+            self.history.setdefault(scene_id, []).append(float(loss))
+            parts.append(f"{scene_id}={loss:.5f}")
+        print("  per-scene val_loss: " + ", ".join(parts))
+
+
 def make_loss(wishart_weight, eps=1e-6):
     """MSE on the 9-channel repr, optionally plus wishart_weight * the
     Wishart (log-det) divergence between the reconstructed covariances
@@ -172,11 +209,13 @@ def main():
     model.compile(optimizer=keras.optimizers.Adam(**opt_kwargs), loss=make_loss(args.wishart_weight))
 
     ckpt_path = os.path.join(RESULTS_DIR, "nbdnet_model.keras")
+    per_scene_val_cb = PerSceneValLoss(shard_paths("val"), args.batch_size, per_scene_norm)
     callbacks = [
         keras.callbacks.ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True),
         keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6),
         keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True),
         keras.callbacks.TerminateOnNaN(),  # fail fast instead of burning the rest of the run on NaN
+        per_scene_val_cb,
     ]
 
     t0 = time.time()
@@ -195,6 +234,7 @@ def main():
     hist = {k: [float(v) for v in vs] for k, vs in history.history.items()}
     hist["elapsed_seconds"] = round(elapsed, 1)
     hist["epochs_ran"] = len(history.history["loss"])
+    hist["val_loss_by_scene"] = per_scene_val_cb.history
     with open(os.path.join(RESULTS_DIR, "train_history.json"), "w") as f:
         json.dump(hist, f, indent=2)
 
