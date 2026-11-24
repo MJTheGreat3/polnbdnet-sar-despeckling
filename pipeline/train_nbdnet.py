@@ -53,35 +53,53 @@ def shard_paths(split):
 
 
 def make_dataset(split, batch_size, shuffle, per_scene_norm):
+    """Per-shard tf.py_function + from_tensor_slices + interleave, instead
+    of a from_generator yielding one tile at a time -- from_generator pays
+    a python<->TF boundary crossing PER TILE (499720/epoch), which was the
+    actual step-time bottleneck (measured 163-203ms/step), not GPU compute.
+    This pays that crossing once per SHARD (one np.load() call), and lets
+    TF slice/batch/interleave the resulting arrays in C++. cycle_length
+    bounds how many shards are held in memory at once, keeping the
+    bounded-by-disk-not-RAM property from the old generator (see module
+    docstring) instead of loading the whole split at once."""
     paths = shard_paths(split)
 
-    def gen():
-        for path in paths:
-            scene_id = os.path.splitext(os.path.basename(path))[0]
-            db_min, db_max = per_scene_norm[scene_id]
-            d = np.load(path)
-            inputs, targets = d["inputs"], d["targets"]
-            norm_cols = np.empty(targets.shape[:-1] + (2,), dtype=np.float32)
-            norm_cols[..., 0], norm_cols[..., 1] = db_min, db_max
-            targets_ext = np.concatenate([targets, norm_cols], axis=-1)
-            idx = np.random.permutation(len(inputs)) if shuffle else np.arange(len(inputs))
-            for i in idx:
-                yield inputs[i], targets_ext[i]
+    def load_shard(path_t):
+        path = path_t.numpy().decode("utf-8")
+        scene_id = os.path.splitext(os.path.basename(path))[0]
+        db_min, db_max = per_scene_norm[scene_id]
+        d = np.load(path)
+        inputs, targets = d["inputs"], d["targets"]
+        norm_cols = np.empty(targets.shape[:-1] + (2,), dtype=np.float32)
+        norm_cols[..., 0], norm_cols[..., 1] = db_min, db_max
+        targets_ext = np.concatenate([targets, norm_cols], axis=-1)
+        return inputs.astype(np.float32), targets_ext.astype(np.float32)
 
-    ds = tf.data.Dataset.from_generator(
-        gen,
-        output_signature=(
-            tf.TensorSpec(shape=TILE_SHAPE, dtype=tf.float32),
-            tf.TensorSpec(shape=TARGET_SHAPE, dtype=tf.float32),
-        ),
+    def shard_dataset(path_t):
+        inputs, targets_ext = tf.py_function(load_shard, [path_t], [tf.float32, tf.float32])
+        inputs.set_shape([None] + list(TILE_SHAPE))
+        targets_ext.set_shape([None] + list(TARGET_SHAPE))
+        shard_ds = tf.data.Dataset.from_tensor_slices((inputs, targets_ext))
+        return shard_ds.shuffle(SHUFFLE_BUFFER) if shuffle else shard_ds
+
+    path_ds = tf.data.Dataset.from_tensor_slices(paths)
+    if shuffle:
+        path_ds = path_ds.shuffle(len(paths), reshuffle_each_iteration=True)
+    cycle_length = 4 if shuffle else 1  # val doesn't need parallel shard interleave
+    ds = path_ds.interleave(
+        shard_dataset,
+        cycle_length=cycle_length,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=not shuffle,
     )
     if shuffle:
         ds = ds.shuffle(SHUFFLE_BUFFER, reshuffle_each_iteration=True)
     # .repeat() + explicit steps_per_epoch (passed by the caller, from
     # meta.json's known tile counts) instead of letting Keras infer epoch
-    # boundaries from StopIteration -- a from_generator dataset has unknown
-    # cardinality, so without this Keras logs a (harmless but alarming)
-    # "input ran out of data; interrupting training" warning every epoch.
+    # boundaries from StopIteration -- an interleaved dataset built from
+    # py_function has unknown cardinality, so without this Keras logs a
+    # (harmless but alarming) "input ran out of data; interrupting
+    # training" warning every epoch.
     ds = ds.repeat()
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE), len(paths)
 

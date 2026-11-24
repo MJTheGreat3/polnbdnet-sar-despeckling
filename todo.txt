@@ -1,0 +1,2 @@
+- wishart -> colsky head (try) to verify integrity of every pixel
+
