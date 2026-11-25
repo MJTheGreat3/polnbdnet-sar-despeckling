@@ -78,7 +78,7 @@ while true; do
     attempt=$((attempt + 1))
     wait_for_low_pressure
     echo "--- attempt ${attempt}/${retries} ---" | tee -a "${log_file}"
-    systemd-run --user --scope -p MemoryMax=16G -- \
+    systemd-run --user --scope -p MemoryMax=40G -- \
         python -u -m "pipeline.${module}" "$@" 2>&1 | tee -a "${log_file}"
     status="${PIPESTATUS[0]}"
     if [ "$status" -eq 0 ]; then

@@ -85,11 +85,16 @@ def make_dataset(split, batch_size, shuffle, per_scene_norm):
     path_ds = tf.data.Dataset.from_tensor_slices(paths)
     if shuffle:
         path_ds = path_ds.shuffle(len(paths), reshuffle_each_iteration=True)
+    # cycle_length=4/num_parallel_calls=2 caps peak RAM to ~2 shards' full
+    # arrays in flight (~2.5GB) at once -- AUTOTUNE let this run further
+    # than expected and got OOM-killed by run.sh's MemoryMax cgroup cap on
+    # a first attempt (report.md: 2026-11-25 new-box migration), so this is
+    # a fixed, predictable bound instead of letting the tuner pick it.
     cycle_length = 4 if shuffle else 1  # val doesn't need parallel shard interleave
     ds = path_ds.interleave(
         shard_dataset,
         cycle_length=cycle_length,
-        num_parallel_calls=tf.data.AUTOTUNE,
+        num_parallel_calls=2 if shuffle else 1,
         deterministic=not shuffle,
     )
     if shuffle:
